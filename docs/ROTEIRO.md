@@ -108,7 +108,7 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 > touch, Wi-Fi, áudio e câmera no iPhone 6 com 138 patches. Usamos só as tensões do motor
 > de vibração (patch 0002 deles) como referência. Não rode os scripts deles sem entender.
 
-## Fase 5: Touchscreen e interface gráfica ← em andamento (touch no kernel ✅ 15/11/2026)
+## Fase 5: Touchscreen e interface gráfica ✅ (touch no kernel + tela inicial LVGL, 15/11/2026)
 O chip de toque é o "N1" (família Apple Z2), no SPI2. Mapa do protocolo: re/MULTITOUCH.md de
 github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido aqui no aparelho.
 
@@ -125,7 +125,13 @@ github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido 
 - [x] T6: m1n1 copia `multi-touch-calibration` e `prox-calibration` do ADT para o Linux (`m1n1/patches/0004`)
 - [x] Primeiro app: `device/desenho` (C sem libc, 6 KB): pinta onde o dedo passa, paleta de cores,
       Home limpa, Volume muda a espessura, Power sai (`/dev/fb0` + `/dev/input` + `ppoll`)
-- [ ] Interface de verdade: LVGL ou Wayland (weston) com toque
+- [x] Interface de verdade: **LVGL** (escolhido em vez de Android/Waydroid: 1 GB de RAM, sem GPU) ✅
+  - L1: compilador cruzado `host/iphone-cc` (clang + sysroot Alpine/musl, estático; `scripts/10-toolchain.sh`)
+  - L2: LVGL v9.6 em `src/lvgl`, drivers prontos `lv_linux_fbdev` (tela) e `lv_evdev` (toque);
+    fonte Montserrat completa (acentos) embutida via `tiny_ttf`; tema escuro
+  - L3: `device/inicio`: hora, data, bateria, temperatura, memória, carregador, brilho, vibrar,
+    abre o Desenho. Power apaga a tela, Volume muda o brilho. Parado: 0% de CPU, ~5 MB de RAM
+  - L4: sobe sozinha no boot (`rootfs/init`); `touch /tmp/sem-inicio; killall inicio` volta ao texto ✅
 
 ## Fase 6: Android
 O Android é um kernel Linux + um userspace próprio (init do Android, Binder, SurfaceFlinger, ART).
