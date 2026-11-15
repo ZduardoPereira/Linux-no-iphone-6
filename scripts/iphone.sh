@@ -36,6 +36,8 @@ def ler(fim_marca, limite):
     return buf
 
 ler(None, 0.3)                                     # descarta sobras de comandos anteriores
+os.write(fd, b"\x15\r")                            # Ctrl+U (limpa a linha) + Enter: prompt novo
+ler(None, 0.8)                                     # espera o prompt e responde ao "\e[6n"
 # As marcas são escritas com "" no meio: no eco do comando aparecem quebradas,
 # e só na SAÍDA de verdade aparecem inteiras.
 os.write(fd, ('echo __I""NI__; %s; echo __F""IM__$?\r' % cmd).encode())

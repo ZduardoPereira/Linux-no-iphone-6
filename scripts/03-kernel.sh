@@ -17,14 +17,20 @@ if [ ! -f "$K/.config" ]; then
     -d ARM64_16K_PAGES -e ARM64_4K_PAGES \
     --set-str LOCALVERSION "-iphone6"
 fi
-# Patches nossos (kernel/patches/*.patch), aplicados uma vez só
+# Patches nossos (kernel/patches/*.patch), aplicados em ordem e uma vez só.
+# O registro do que já foi aplicado fica em $K/.iphone6-patches (nome do patch).
+# Se você alterar um patch já aplicado, recomece com: git -C "$KSRC" checkout . && rm "$KSRC/.iphone6-patches"
+REG="$K/.iphone6-patches"
+touch "$REG"
 for p in "$ROOT"/kernel/patches/*.patch; do
   [ -e "$p" ] || continue
-  if git -C "$K" apply --check -R "$p" 2>/dev/null; then
-    log "Patch já aplicado: $(basename "$p")"
+  n="$(basename "$p")"
+  if grep -qxF "$n" "$REG"; then
+    log "Patch já aplicado: $n"
   else
-    log "Aplicando patch: $(basename "$p")"
+    log "Aplicando patch: $n"
     git -C "$K" apply "$p"
+    echo "$n" >> "$REG"
   fi
 done
 # Ajustes nossos ficam em kernel/iphone6.config (versionado no git); aplicados sempre,

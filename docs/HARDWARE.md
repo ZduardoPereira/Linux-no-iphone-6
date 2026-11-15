@@ -21,7 +21,8 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | `gpio` | pinos | ✅ `apple-gpio-pinctrl` |
 | `uart0` | serial de debug | ✅ `ttySAC0` (precisa de cabo especial) |
 | `i2c0` | barramento I2C 0 | ✅ |
-| `i2c1`, `i2c2` | barramentos I2C 1 e 2 | ❌ não ativados no device tree |
+| `i2c1` | barramento I2C 1 | ✅ (patch 0003); também respondem 0x58 e 0x75 |
+| `i2c2` | barramento I2C 2 | ❌ não ativado no device tree |
 | `spi1..3` | barramentos SPI | ❌ |
 | `dwi` | brilho da tela | ✅ `apple-dwi-bl` (0–2047) |
 | `usb-complex` + `otgphyctrl` | USB | ⚠️ só em PIO + patch 0002 (DMA falha neste caminho de boot) |
@@ -34,7 +35,8 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | `isp`, `jpeg`, `ave`, `vxd`, `scaler` | câmera, JPEG, vídeo, escalador | ❌ |
 | `mca0..4` + `i2s-switch` | áudio digital | ❌ |
 | `apcie` | PCIe (onde fica o Wi-Fi) | ❌ m1n1: "pcie: Unsupported compatible" |
-| `tempsensor0..4`, `dietempctl0`, `amc`, `sochot0/1` | sensores de temperatura | ❌ — **bom primeiro driver em C** |
+| `tempsensor0..4` | sensores de temperatura | ✅ driver nosso `apple-t7000-temp` (patch 0004); `readBK` bits 27..16 = décimos de °C (hipótese) |
+| `dietempctl0`, `amc`, `sochot0/1` | controle térmico / temperatura da RAM | ❌ |
 | `dart-*` | IOMMUs (uma por bloco) | ❌ |
 
 ## Chips externos (ligados nos barramentos)
@@ -45,7 +47,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | i2c0 | `backlight,lm3534` | driver do LED da tela | (brilho já vem pelo `dwi`) |
 | i2c0 | `tristar,cbtl1610` | chave do conector Lightning | ❌ |
 | i2c0 | `display-pmu,chestnut` | energia da tela | ❌ |
-| i2c1 | `vibrator,drv2604` (TI) | motor de vibração | **sim: `drv260x`** → só falta ativar i2c1 e descrever no DT |
+| i2c1 | `vibrator,drv2604` (TI) | motor de vibração | ✅ `drv260x` (patch 0003) + `vibrar` |
 | i2c1 | `charger,sn2400` (TI) | carregador da bateria | ❌ |
 | i2c1 | `audio-control,cs35l19` (Cirrus) | amplificador do alto-falante | ~ (`cs35l33` é parecido) |
 | i2c2 | `als,ct819` | sensor de luz ambiente | ❌ |

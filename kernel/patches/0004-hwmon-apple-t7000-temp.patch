@@ -1,0 +1,248 @@
+hwmon: driver novo para os sensores de temperatura do Apple A8 (fase 4.2)
+
+drivers/hwmon/apple-t7000-temp.c + Kconfig/Makefile + nós no device tree do iPhone 6.
+Formato do registrador descoberto por engenharia reversa (ver comentário no driver).
+
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -33,3 +33,24 @@
+ 		vib-overdrive-mv = <3320>;
+ 	};
+ };
++
++/*
++ * Sensores de temperatura do chip A8 (Linux-no-iphone-6, fase 4.2).
++ * Do ADT da Apple (arm-io/tempsensor0..4): offsets "sensor-offset-readBK".
++ * Driver: drivers/hwmon/apple-t7000-temp.c
++ */
++&{/soc} {
++	temperature-sensor@20e02b000 {
++		compatible = "apple,t7000-tempsensor";
++		reg = <0x2 0x0e02b000 0x0 0x1000>;
++		apple,sensor-offsets = <0x18 0x5c>;
++		apple,sensor-names = "SoC die 0", "SoC die 1";
++	};
++
++	temperature-sensor@202230000 {
++		compatible = "apple,t7000-tempsensor";
++		reg = <0x2 0x02230000 0x0 0x1000>;
++		apple,sensor-offsets = <0x20 0x60 0x220>;
++		apple,sensor-names = "CPU (TCC) 0", "CPU (TCC) 1", "CPU (TCC) 2";
++	};
++};
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index fecff8610..fb72f1928 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -377,6 +377,13 @@ config SENSORS_FAM15H_POWER
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called fam15h_power.
+ 
++config SENSORS_APPLE_T7000_TEMP
++	tristate "Apple A8 (T7000) on-die temperature sensors"
++	depends on ARCH_APPLE || COMPILE_TEST
++	help
++	  Temperature sensors inside the Apple A8 SoC (iPhone 6, iPad mini 4,
++	  iPod touch 6), found by reverse engineering (Linux-no-iphone-6).
++
+ config SENSORS_APPLESMC
+ 	tristate "Apple SMC (Motion sensor, light sensor, keyboard backlight)"
+ 	depends on INPUT && X86
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+index 1229b6b39..41e7aa1d3 100644
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -47,6 +47,7 @@ obj-$(CONFIG_SENSORS_ADT7462)	+= adt7462.o
+ obj-$(CONFIG_SENSORS_ADT7470)	+= adt7470.o
+ obj-$(CONFIG_SENSORS_ADT7475)	+= adt7475.o
+ obj-$(CONFIG_SENSORS_AHT10)	+= aht10.o
++obj-$(CONFIG_SENSORS_APPLE_T7000_TEMP)	+= apple-t7000-temp.o
+ obj-$(CONFIG_SENSORS_APPLESMC)	+= applesmc.o
+ obj-$(CONFIG_SENSORS_AQUACOMPUTER_D5NEXT) += aquacomputer_d5next.o
+ obj-$(CONFIG_SENSORS_ARCTIC_FAN_CONTROLLER)	+= arctic_fan_controller.o
+diff --git a/drivers/hwmon/apple-t7000-temp.c b/drivers/hwmon/apple-t7000-temp.c
+new file mode 100644
+index 000000000..049b610fc
+--- /dev/null
++++ b/drivers/hwmon/apple-t7000-temp.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Sensores de temperatura do Apple A8 (T7000) — iPhone 6, iPad mini 4, iPod touch 6.
++ *
++ * Projeto Linux-no-iphone-6, fase 4.2 (primeiro driver escrito do zero).
++ *
++ * Não há documentação pública. O que se sabe veio de engenharia reversa:
++ *  - O ADT (device tree da Apple) lista 5 sensores ("tempsensor0..4") em dois blocos:
++ *      PMGR @ 0x20e02b000: "SOC Die Temp Sensor0/1"  (readBK em +0x18 e +0x5c)
++ *      TCC  @ 0x202230000: "TCC Temp Sensor0/1/2"    (readBK em +0x20, +0x60, +0x220)
++ *  - O registrador "readBK" é atualizado sozinho pelo hardware (~a cada 2,5 ms,
++ *    CTL1 = 60000 ciclos de 24 MHz). Formato observado:
++ *      bit  31     : leitura válida
++ *      bit  30     : (flag desconhecida, às vezes ligada)
++ *      bits 27..16 : temperatura em décimos de °C (hipótese: sobe ~11 °C com a CPU
++ *                    a 100% por 40 s e volta em seguida; parado fica em ~36 °C)
++ *      bits 11..0  : código bruto do sensor (outra escala, não usado aqui)
++ *  - O bloco TCC só responde a acessos de 32 bits (em 64 bits lê zero).
++ *
++ * Device tree (um nó por bloco):
++ *      temperature-sensor@20e02b000 {
++ *          compatible = "apple,t7000-tempsensor";
++ *          reg = <0x2 0x0e02b000 0x0 0x1000>;
++ *          apple,sensor-offsets = <0x18 0x5c>;
++ *          apple,sensor-names = "SoC die 0", "SoC die 1";
++ *      };
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/hwmon.h>
++#include <linux/io.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++
++#define APPLE_TEMP_VALID	BIT(31)
++#define APPLE_TEMP_DECI_C	GENMASK(27, 16)
++#define APPLE_TEMP_MAX		8
++
++struct apple_temp {
++	void __iomem *base;
++	unsigned int count;
++	u32 offsets[APPLE_TEMP_MAX];
++	const char *names[APPLE_TEMP_MAX];
++};
++
++static umode_t apple_temp_is_visible(const void *data,
++				     enum hwmon_sensor_types type,
++				     u32 attr, int channel)
++{
++	const struct apple_temp *t = data;
++
++	if (type != hwmon_temp || channel >= t->count)
++		return 0;
++
++	switch (attr) {
++	case hwmon_temp_input:
++		return 0444;
++	case hwmon_temp_label:
++		return t->names[channel] ? 0444 : 0;
++	default:
++		return 0;
++	}
++}
++
++static int apple_temp_read(struct device *dev, enum hwmon_sensor_types type,
++			   u32 attr, int channel, long *val)
++{
++	struct apple_temp *t = dev_get_drvdata(dev);
++	u32 reg = readl(t->base + t->offsets[channel]);
++
++	if (!(reg & APPLE_TEMP_VALID))
++		return -ENODATA;
++
++	/* o hwmon usa miligraus Celsius: décimos de grau * 100 */
++	*val = FIELD_GET(APPLE_TEMP_DECI_C, reg) * 100;
++	return 0;
++}
++
++static int apple_temp_read_string(struct device *dev,
++				  enum hwmon_sensor_types type, u32 attr,
++				  int channel, const char **str)
++{
++	struct apple_temp *t = dev_get_drvdata(dev);
++
++	*str = t->names[channel];
++	return 0;
++}
++
++static const struct hwmon_ops apple_temp_ops = {
++	.is_visible = apple_temp_is_visible,
++	.read = apple_temp_read,
++	.read_string = apple_temp_read_string,
++};
++
++/* 8 canais possíveis; is_visible esconde os que o device tree não usa */
++static const struct hwmon_channel_info * const apple_temp_info[] = {
++	HWMON_CHANNEL_INFO(temp,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL),
++	NULL
++};
++
++static const struct hwmon_chip_info apple_temp_chip_info = {
++	.ops = &apple_temp_ops,
++	.info = apple_temp_info,
++};
++
++static int apple_temp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device *hwmon;
++	struct resource *res;
++	struct apple_temp *t;
++	const char *name;
++	int n;
++
++	t = devm_kzalloc(dev, sizeof(*t), GFP_KERNEL);
++	if (!t)
++		return -ENOMEM;
++
++	t->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(t->base))
++		return PTR_ERR(t->base);
++
++	/*
++	 * Um nome por bloco (com o endereço): se os dois tivessem o mesmo nome, o
++	 * "sensors" (libsensors) confundiria os dois chips e esconderia canais.
++	 */
++	name = devm_kasprintf(dev, GFP_KERNEL, "apple_temp_%llx",
++			      (unsigned long long)res->start);
++	if (!name)
++		return -ENOMEM;
++
++	n = device_property_count_u32(dev, "apple,sensor-offsets");
++	if (n <= 0 || n > APPLE_TEMP_MAX)
++		return dev_err_probe(dev, -EINVAL,
++				     "apple,sensor-offsets inválido (%d)\n", n);
++	t->count = n;
++	device_property_read_u32_array(dev, "apple,sensor-offsets",
++				       t->offsets, n);
++	/* nomes são opcionais */
++	device_property_read_string_array(dev, "apple,sensor-names",
++					  t->names, n);
++
++	hwmon = devm_hwmon_device_register_with_info(dev, name, t,
++						     &apple_temp_chip_info,
++						     NULL);
++	if (IS_ERR(hwmon))
++		return PTR_ERR(hwmon);
++
++	dev_info(dev, "%u sensor(es) de temperatura\n", t->count);
++	return 0;
++}
++
++static const struct of_device_id apple_temp_of_match[] = {
++	{ .compatible = "apple,t7000-tempsensor" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, apple_temp_of_match);
++
++static struct platform_driver apple_temp_driver = {
++	.driver = {
++		.name = "apple-t7000-temp",
++		.of_match_table = apple_temp_of_match,
++	},
++	.probe = apple_temp_probe,
++};
++module_platform_driver(apple_temp_driver);
++
++MODULE_DESCRIPTION("Apple A8 (T7000) on-die temperature sensors");
++MODULE_LICENSE("GPL");

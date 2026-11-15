@@ -62,8 +62,16 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [x] Boot: `i2cdetect -y 1` mostra o chip em 0x5a (`UU`); calibração automática vibra no boot
 - [x] `vibrar 300` faz o iPhone vibrar ✅ (15/11/2026)
 
+### 4.2 Sensores de temperatura — primeiro driver do zero (em andamento)
+- [x] Mapa dos registradores pelo ADT (5 sensores em 2 blocos: PMGR e TCC)
+- [x] Ferramenta `device/regs` (lê registradores físicos via `/dev/mem` + `mmap`)
+- [x] Engenharia reversa: `readBK` bits 27..16 = temperatura (hipótese: décimos de °C),
+      bit 31 = válido; bloco TCC só aceita acesso de 32 bits; experimento de aquecimento
+- [x] Driver `drivers/hwmon/apple-t7000-temp.c` + device tree (`kernel/patches/0004`)
+- [ ] Boot: `sensors` mostra os 5 sensores
+- [ ] Confirmar a escala: iPhone frio (desligado ~15 min) deve ler perto da temperatura ambiente
+
 ### Depois
-1. **Sensores de temperatura** (`tempsensor0..4`): primeiro driver em C (hwmon)
 2. **Bateria/carregador**: ler nível de bateria
 3. **Touchscreen** (Apple Z2, SPI): o mais importante para o Android
 4. **Armazenamento interno**: acompanhar o trabalho em andamento da Hoolock

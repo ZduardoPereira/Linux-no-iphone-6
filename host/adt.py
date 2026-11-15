@@ -35,7 +35,10 @@ def texto(v):
     """Mostra strings como texto e o resto como u32/hex."""
     imprimivel = set(string.printable.encode()) - set(b"\x0b\x0c")
     partes = v.rstrip(b"\0").split(b"\0")
-    if v and v.endswith(b"\0") and all(p and all(c in imprimivel for c in p) for p in partes):
+    # Um u32 pequeno (ex.: 0x24) tem bytes "$\0\0\0" e parece string de 1 letra:
+    # só tratamos como texto se tiver pelo menos 2 caracteres.
+    if v and v.endswith(b"\0") and len(v.rstrip(b"\0")) >= 2 and \
+            all(p and all(c in imprimivel for c in p) for p in partes):
         return ", ".join(p.decode() for p in partes)
     if len(v) % 4 == 0 and 0 < len(v) <= 64:
         return " ".join("%#x" % x for x in struct.unpack("<%dI" % (len(v) // 4), v))
