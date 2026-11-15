@@ -1,0 +1,215 @@
+spi: apple: variante S5L (A7-A11) em polling + SPI2 do touch no device tree (fase 5, T1)
+
+diff --git a/drivers/spi/spi-apple.c b/drivers/spi/spi-apple.c
+index 61eefb0..9d25084 100644
+--- a/drivers/spi/spi-apple.c
++++ b/drivers/spi/spi-apple.c
+@@ -15,6 +15,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/property.h>
+ #include <linux/spi/spi.h>
+ 
+ #define APPLE_SPI_CTRL			0x000
+@@ -120,10 +121,25 @@
+  */
+ #define APPLE_SPI_TIMEOUT_MS		200
+ 
++/*
++ * Variante S5L (A7-A11, ADT "spi-1,samsung"), Linux-no-iphone-6.
++ * Bloco mais antigo: os níveis dos FIFOs e os flags (escrever 1 limpa) ficam no
++ * STATUS; não existem os registradores 0x10c-0x168 do M1 (FIFOSTAT, IE/IF,
++ * SHIFTCFG, PINCFG, DELAY). O iOS sempre liga os bits 3, 4 e 14 do CFG e roda
++ * tudo em full duplex, 8 bits por palavra. Mapa: re/SPI-S5L.md de
++ * github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS).
++ */
++#define APPLE_SPI_S5L_LEVEL_TX		GENMASK(10, 6)
++#define APPLE_SPI_S5L_LEVEL_RX		GENMASK(15, 11)
++#define APPLE_SPI_S5L_STATUS_CLEAR	0x40000f
++#define APPLE_SPI_S5L_CFG_BASE		(BIT(3) | BIT(4) | BIT(14))
++#define APPLE_SPI_S5L_CLKDIV_MAX	2048
++
+ struct apple_spi {
+ 	void __iomem      *regs;        /* MMIO register address */
+ 	struct clk        *clk;         /* bus clock */
+ 	struct completion done;         /* wake-up from interrupt */
++	bool              s5l;          /* variante A7-A11 (só polling) */
+ };
+ 
+ static inline void reg_write(struct apple_spi *spi, int offset, u32 value)
+@@ -454,6 +470,87 @@ err:
+ 	return ret;
+ }
+ 
++static void apple_spi_s5l_init(struct apple_spi *spi)
++{
++	reg_write(spi, APPLE_SPI_PIN, APPLE_SPI_PIN_CS);		/* CS interno inativo */
++	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RX_RESET | APPLE_SPI_CTRL_TX_RESET);
++	reg_write(spi, APPLE_SPI_CFG, APPLE_SPI_S5L_CFG_BASE);
++	reg_write(spi, APPLE_SPI_WORD_DELAY, 0);
++	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_S5L_STATUS_CLEAR);
++}
++
++/*
++ * Uma transferência na variante S5L, em polling, na mesma ordem do iOS:
++ * contadores e STATUS, CFG base, RUN + reset dos FIFOs, modo PIO, e então
++ * esvazia o RX / completa o TX (0xff quando não há dados) até o fim.
++ * O bloco perde a configuração quando o power domain desliga, então tudo é
++ * reprogramado a cada transferência.
++ */
++static int apple_spi_s5l_transfer_one(struct spi_controller *ctlr,
++				      struct spi_device *device,
++				      struct spi_transfer *t)
++{
++	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
++	const u8 *tx = t->tx_buf;
++	u8 *rx = t->rx_buf;
++	u32 len = t->len, tx_feito = 0, rx_feito = 0;
++	u32 cfg = APPLE_SPI_S5L_CFG_BASE |
++		  (device->mode & SPI_CPHA ? APPLE_SPI_CFG_CPHA : 0) |
++		  (device->mode & SPI_CPOL ? APPLE_SPI_CFG_CPOL : 0) |
++		  (device->mode & SPI_LSB_FIRST ? APPLE_SPI_CFG_LSB_FIRST : 0);
++	/* tempo do pior caso: 8 bits por byte na velocidade pedida, mais 200 ms */
++	unsigned long limite = jiffies + msecs_to_jiffies(APPLE_SPI_TIMEOUT_MS) +
++			       usecs_to_jiffies(div_u64(8ULL * len * USEC_PER_SEC,
++							t->speed_hz));
++	u32 div = DIV_ROUND_UP(clk_get_rate(spi->clk), t->speed_hz);
++	int ret = 0;
++
++	reg_write(spi, APPLE_SPI_CLKDIV, clamp_t(u32, div, 1, APPLE_SPI_S5L_CLKDIV_MAX));
++	reg_write(spi, APPLE_SPI_WORD_DELAY, 0);
++	reg_write(spi, APPLE_SPI_RXCNT, len);
++	reg_write(spi, APPLE_SPI_TXCNT, len);
++	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_S5L_STATUS_CLEAR);
++	reg_write(spi, APPLE_SPI_CFG, cfg);
++	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RUN |
++		  APPLE_SPI_CTRL_TX_RESET | APPLE_SPI_CTRL_RX_RESET);
++	reg_write(spi, APPLE_SPI_CFG, cfg |
++		  FIELD_PREP(APPLE_SPI_CFG_MODE, APPLE_SPI_CFG_MODE_IRQ));
++
++	while (rx_feito < len) {
++		u32 st = reg_read(spi, APPLE_SPI_STATUS);
++		u32 nrx = FIELD_GET(APPLE_SPI_S5L_LEVEL_RX, st);
++		u32 ntx = FIELD_GET(APPLE_SPI_S5L_LEVEL_TX, st);
++		bool andou = nrx || tx_feito < len;
++
++		reg_write(spi, APPLE_SPI_STATUS, st & APPLE_SPI_S5L_STATUS_CLEAR);
++		while (nrx-- && rx_feito < len) {
++			u8 b = reg_read(spi, APPLE_SPI_RXDATA);
++
++			if (rx)
++				rx[rx_feito] = b;
++			rx_feito++;
++		}
++		while (ntx < APPLE_SPI_FIFO_DEPTH && tx_feito < len) {
++			reg_write(spi, APPLE_SPI_TXDATA, tx ? tx[tx_feito] : 0xff);
++			tx_feito++;
++			ntx++;
++		}
++		if (!andou) {
++			if (time_after(jiffies, limite)) {
++				dev_err(&ctlr->dev, "S5L: timeout (%u/%u bytes)\n",
++					rx_feito, len);
++				ret = -ETIMEDOUT;
++				break;
++			}
++			cpu_relax();
++		}
++	}
++
++	reg_write(spi, APPLE_SPI_CFG, cfg);			/* modo 0 */
++	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_S5L_STATUS_CLEAR);
++	return ret;
++}
++
+ static int apple_spi_probe(struct platform_device *pdev)
+ {
+ 	struct apple_spi *spi;
+@@ -476,6 +573,26 @@ static int apple_spi_probe(struct platform_device *pdev)
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(spi->clk),
+ 				     "Unable to find or enable bus clock\n");
+ 
++	spi->s5l = (uintptr_t)device_get_match_data(&pdev->dev);
++	if (spi->s5l) {
++		/* variante A7-A11: só polling, 8 bits, CS por GPIO */
++		ctlr->bus_num = pdev->id;
++		ctlr->num_chipselect = 1;
++		ctlr->mode_bits = SPI_CPHA | SPI_CPOL | SPI_LSB_FIRST;
++		ctlr->bits_per_word_mask = SPI_BPW_MASK(8);
++		ctlr->transfer_one = apple_spi_s5l_transfer_one;
++		ctlr->use_gpio_descriptors = true;
++		ctlr->auto_runtime_pm = true;
++
++		pm_runtime_set_active(&pdev->dev);
++		ret = devm_pm_runtime_enable(&pdev->dev);
++		if (ret < 0)
++			return ret;
++
++		apple_spi_s5l_init(spi);
++		return devm_spi_register_controller(&pdev->dev, ctlr);
++	}
++
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0)
+ 		return irq;
+@@ -511,6 +628,7 @@ static int apple_spi_probe(struct platform_device *pdev)
+ 
+ static const struct of_device_id apple_spi_of_match[] = {
+ 	{ .compatible = "apple,t8103-spi", },
++	{ .compatible = "apple,t7000-spi", .data = (void *)1 },	/* variante S5L */
+ 	{ .compatible = "apple,spi", },
+ 	{}
+ };
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 10b1981..61286fe 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -12,6 +12,14 @@
+ / {
+ 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
+ 	model = "Apple iPhone 6";
++
++	/* Clock dos SPIs: ADT arm-io "clock-frequencies"[302 - 256] = 60 MHz */
++	clk_spi: clock-spi {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <60000000>;
++		clock-output-names = "spi_ref";
++	};
+ };
+ 
+ /*
+@@ -63,6 +71,32 @@
+  * Driver: drivers/hwmon/apple-t7000-temp.c
+  */
+ &{/soc} {
++	/*
++	 * SPI2: barramento do touchscreen (fase 5, T1). ADT arm-io/spi2: reg 0xa088000,
++	 * IRQ 0x9a, "spi-1,samsung" (variante S5L do spi-apple), CS por GPIO 185.
++	 * Pinos 182-185 já vêm na função SPI pelo iBoot.
++	 */
++	spi2: spi@20a088000 {
++		compatible = "apple,t7000-spi";
++		reg = <0x2 0x0a088000 0x0 0x4000>;
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_IRQ 154 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&clk_spi>;
++		power-domains = <&ps_spi2>;
++		cs-gpios = <&pinctrl 185 GPIO_ACTIVE_LOW>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/*
++		 * Chip de toque "N1" (ADT arm-io/spi2/multi-touch). Ainda sem driver:
++		 * para o protótipo, liga-se o spidev a ele (driver_override).
++		 */
++		touchscreen@0 {
++			compatible = "apple,n61-touchscreen";
++			reg = <0>;
++			spi-max-frequency = <4000000>;
++		};
++	};
+ 	/*
+ 	 * Medidor de bateria bq27540 por HDQ na UART5 (fase 4.4). A UART é usada só
+ 	 * por este driver (polling, 8N2), não como porta serial.

@@ -108,12 +108,18 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 > touch, Wi-Fi, áudio e câmera no iPhone 6 com 138 patches. Usamos só as tensões do motor
 > de vibração (patch 0002 deles) como referência. Não rode os scripts deles sem entender.
 
-## Fase 5: Interface gráfica
-- [ ] Desenhar direto no framebuffer (`/dev/fb0` ou DRM dumb buffer)
-- [ ] Interface leve com LVGL ou Weston/Wayland com renderização por software (pixman)
-- [ ] Com touch funcionando (fase 4), interface tocável
+## Fase 5: Touchscreen e interface gráfica ← em andamento
+O chip de toque é o "N1" (família Apple Z2), no SPI2. Mapa do protocolo: re/MULTITOUCH.md de
+github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido aqui no aparelho.
 
-**Você aprende:** DRM/KMS, framebuffer, compositores, input.
+- [x] T1: SPI2 — variante S5L (A7-A11) no `spi-apple`, em polling (`kernel/patches/0009`)
+- [x] T2: ligar o chip (Chestnut LDO2, clock 32 kHz em `0x20e01e000`, reset no GPIO 2) e
+      sondar o bootloader: `python3 device/n1.py liga` → **respondeu `1f01`/`4879`** ✅
+- [ ] T3: firmware (`N61.mtprops` do rootfs do iOS 12.5) extraído no PC
+- [ ] T4: protótipo carrega calibração (ADT, `/dev/mtd1`) + firmware, EXECUTE, lê os toques
+- [ ] T5: driver de kernel (adaptar o `apple_z2`)
+- [ ] T6: m1n1 passa a calibração para o Linux
+- [ ] Interface: desenhar no framebuffer, depois LVGL/Wayland com toque
 
 ## Fase 6: Android
 O Android é um kernel Linux + um userspace próprio (init do Android, Binder, SurfaceFlinger, ART).
