@@ -84,7 +84,8 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [x] Device tree: UART5 ativa + pino 57 na função UART (`kernel/patches/0006`) → `/dev/ttySAC5`
 - [x] Protótipo em Python (`device/hdq.py`): **95 %**, 4345 mV, 29 °C, 1732/1810 mAh, 2 ciclos ([BQ27540.md](BQ27540.md))
 - [ ] Corrente da bateria: `0x14` fica em 997 fixo (firmware da Apple?)
-- [ ] Driver nosso ligando a UART ao núcleo `bq27xxx` do kernel
+- [x] Driver `drivers/power/supply/apple_hdq_battery.c` (`kernel/patches/0007`): UART5 em polling 8N2 + núcleo `bq27xxx`
+- [ ] Boot: `/sys/class/power_supply/bq27540-battery/capacity` mostra o percentual
 
 ### Depois
 2. **Bateria/carregador**: ler nível de bateria

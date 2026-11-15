@@ -1,0 +1,370 @@
+power: driver novo do medidor de bateria bq27540 por HDQ na UART5 (fase 4.4)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 27bab01..0e02b68 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -12,10 +12,6 @@
+ / {
+ 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
+ 	model = "Apple iPhone 6";
+-
+-	aliases {
+-		serial5 = &serial5;	/* vira /dev/ttySAC5 */
+-	};
+ };
+ 
+ /*
+@@ -54,7 +50,7 @@
+ 	 * 450 mA = o limite que o iBoot programa (cabe nos 500 mA de uma porta USB 2.0).
+ 	 * Driver: drivers/power/supply/sn2400_charger.c
+ 	 */
+-	charger@75 {
++	charger: charger@75 {
+ 		compatible = "ti,sn2400";
+ 		reg = <0x75>;
+ 		input-current-limit-microamp = <450000>;
+@@ -67,18 +63,18 @@
+  * Driver: drivers/hwmon/apple-t7000-temp.c
+  */
+ &{/soc} {
+-	serial5: serial@20a0d4000 {
+-		compatible = "apple,s5l-uart";
++	/*
++	 * Medidor de bateria bq27540 por HDQ na UART5 (fase 4.4). A UART é usada só
++	 * por este driver (polling, 8N2), não como porta serial.
++	 * Driver: drivers/power/supply/apple_hdq_battery.c
++	 */
++	battery-gauge@20a0d4000 {
++		compatible = "apple,t7000-hdq-gauge";
+ 		reg = <0x2 0x0a0d4000 0x0 0x4000>;
+-		reg-io-width = <4>;
+-		interrupt-parent = <&aic>;
+-		interrupts = <AIC_IRQ 163 IRQ_TYPE_LEVEL_HIGH>;
+-		/* mesmos clocks deixados pelo bootloader que as outras UARTs usam */
+-		clocks = <&clkref>, <&clkref>;
+-		clock-names = "uart", "clk_uart_baud0";
+ 		power-domains = <&ps_uart5>;
+ 		pinctrl-0 = <&uart5_pins>;
+ 		pinctrl-names = "default";
++		apple,hdq-master = <&charger>;	/* quem entrega o fio (SN2400, 0x1d) */
+ 	};
+ 
+ 	temperature-sensor@20e02b000 {
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index 475d0d5..fe8d7ef 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -778,6 +778,14 @@ config CHARGER_BQ2415X
+ 	  You'll need this driver to charge batteries on e.g. Nokia
+ 	  RX-51/N900.
+ 
++config BATTERY_APPLE_HDQ
++	tristate "iPhone 6 battery gauge (bq27540 over HDQ on UART5)"
++	depends on BATTERY_BQ27XXX && I2C
++	depends on ARCH_APPLE || COMPILE_TEST
++	help
++	  Reads the TI bq27540 gas gauge of the iPhone 6 through the HDQ
++	  single-wire bus, driven by UART5 (Linux-no-iphone-6).
++
+ config CHARGER_SN2400
+ 	tristate "TI SN2400 (Apple 'Tigris') charger"
+ 	depends on I2C
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 5e4840a..80a6e33 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -99,6 +99,7 @@ obj-$(CONFIG_BATTERY_PM8916_BMS_VM)	+= pm8916_bms_vm.o
+ obj-$(CONFIG_CHARGER_PM8916_LBC)	+= pm8916_lbc.o
+ obj-$(CONFIG_CHARGER_BQ2415X)	+= bq2415x_charger.o
+ obj-$(CONFIG_CHARGER_SN2400)	+= sn2400_charger.o
++obj-$(CONFIG_BATTERY_APPLE_HDQ)	+= apple_hdq_battery.o
+ obj-$(CONFIG_CHARGER_BQ24190)	+= bq24190_charger.o
+ obj-$(CONFIG_CHARGER_BQ24257)	+= bq24257_charger.o
+ obj-$(CONFIG_CHARGER_BQ24735)	+= bq24735-charger.o
+diff --git b/drivers/power/supply/apple_hdq_battery.c b/drivers/power/supply/apple_hdq_battery.c
+new file mode 100644
+index 0000000..8f96fd1
+--- /dev/null
++++ b/drivers/power/supply/apple_hdq_battery.c
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Medidor de bateria TI bq27540 do iPhone 6, lido por HDQ através da UART5.
++ *
++ * Projeto Linux-no-iphone-6, fase 4.4. Ver docs/BQ27540.md do projeto.
++ *
++ * HDQ é o protocolo de 1 fio da TI. Usamos o truque da nota SLUA408: uma UART a
++ * 57600 baud, 8N2 (um quadro = 191 us = um bit HDQ):
++ *     enviar 0xFE = pulso curto = "1"      enviar 0xC0 = pulso longo = "0"
++ *     break      = 0x00 a 9600 baud (~940 us em zero)
++ * O fio é compartilhado entre TX e RX: o RX recebe o eco dos 8 quadros do comando
++ * e depois os 8 bits da resposta (0xFE = 1, 0xE0 = 0).
++ *
++ * O fio também é usado pelo carregador SN2400. Antes de falar com o medidor,
++ * pedimos o fio a ele: registrador 0x1d = 0x04 e esperar o bit 5; para devolver,
++ * 0x1d = 0. (Protocolo do iOS segundo github.com/ITSMEFRTRUST/linux-on-iphone6,
++ * conferido por nós com um protótipo em Python.)
++ *
++ * A UART é programada direto pelos registradores, em polling: o driver de serial
++ * genérico não deixa escolher 2 stop bits pela API serdev. Todos os quadros passam
++ * pelos FIFOs, então os tempos ficam por conta do hardware.
++ *
++ * Os registradores do medidor seguem o bq27541, e o núcleo bq27xxx do Linux faz o
++ * resto (percentual, tensão, temperatura, capacidade, ciclos). Exceção: neste
++ * firmware da Apple o registrador de corrente média (0x14) fica parado num valor
++ * sem sentido; devolvemos 0 para não publicar uma corrente falsa.
++ */
++
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power/bq27xxx_battery.h>
++#include <linux/workqueue.h>
++
++/* Registradores da UART (mesmo layout Samsung/Apple S5L do samsung_tty) */
++#define UART_ULCON	0x00
++#define UART_UCON	0x04
++#define UART_UFCON	0x08
++#define UART_UTRSTAT	0x10
++#define  UTRSTAT_RXDR	BIT(0)
++#define  UTRSTAT_TXE	BIT(2)
++#define UART_UTXH	0x20
++#define UART_URXH	0x24
++#define UART_UBRDIV	0x28
++
++#define ULCON_8N2	0x07		/* 8 bits + 2 stop bits */
++#define UCON_POLLING	0x05		/* RX e TX em modo "polling/interrupção", sem IRQs */
++#define UFCON_FIFOS	0x31		/* FIFOs ligados (valor do samsung_tty) */
++#define UFCON_RESET	0x06		/* zera os FIFOs de RX e TX */
++
++/* clock da UART = 24 MHz; UBRDIV = 24 MHz / (16 * baud) - 1 (valores medidos) */
++#define UBRDIV_57600	25
++#define UBRDIV_9600	155
++
++#define HDQ_UM		0xfe
++#define HDQ_ZERO	0xc0
++#define HDQ_REG_CORRENTE 0x14		/* BQ27XXX_REG_AI do bq27541: inválido aqui */
++
++/* Carregador SN2400: entrega do fio */
++#define SN2400_HDQ	0x1d
++#define SN2400_HDQ_PEDE	0x04
++#define SN2400_HDQ_OK	BIT(5)
++#define HDQ_SEGURA_MS	300		/* devolve o fio 300 ms depois do último uso */
++
++struct apple_hdq {
++	struct bq27xxx_device_info di;	/* primeiro: o núcleo usa container_of */
++	void __iomem *base;
++	struct i2c_client *carregador;
++	struct mutex lock;
++	struct delayed_work devolve;
++	bool com_fio;
++};
++
++static void uart_baud(struct apple_hdq *h, u32 ubrdiv)
++{
++	u32 st;
++
++	/* só muda a velocidade com o transmissor vazio */
++	readl_poll_timeout(h->base + UART_UTRSTAT, st, st & UTRSTAT_TXE, 20, 5000);
++	writel(ubrdiv, h->base + UART_UBRDIV);
++}
++
++static void uart_init(struct apple_hdq *h)
++{
++	writel(ULCON_8N2, h->base + UART_ULCON);
++	writel(UCON_POLLING, h->base + UART_UCON);
++	writel(UFCON_FIFOS | UFCON_RESET, h->base + UART_UFCON);
++	writel(UFCON_FIFOS, h->base + UART_UFCON);
++	writel(UBRDIV_57600, h->base + UART_UBRDIV);
++}
++
++/* lê até n bytes do RX, esperando no máximo 'us' microssegundos */
++static int uart_recebe(struct apple_hdq *h, u8 *buf, int n, unsigned int us)
++{
++	ktime_t fim = ktime_add_us(ktime_get(), us);
++	int lidos = 0;
++
++	while (lidos < n) {
++		if (readl(h->base + UART_UTRSTAT) & UTRSTAT_RXDR)
++			buf[lidos++] = readl(h->base + UART_URXH);
++		else if (ktime_after(ktime_get(), fim))
++			break;
++		else
++			usleep_range(50, 100);
++	}
++	return lidos;
++}
++
++static int pede_fio(struct apple_hdq *h)
++{
++	int ret, i;
++
++	if (h->com_fio)
++		return 0;
++	ret = i2c_smbus_write_byte_data(h->carregador, SN2400_HDQ, SN2400_HDQ_PEDE);
++	for (i = 0; !ret && i < 100; i++) {		/* até ~1 s */
++		ret = i2c_smbus_read_byte_data(h->carregador, SN2400_HDQ);
++		if (ret >= 0 && (ret & SN2400_HDQ_OK)) {
++			h->com_fio = true;
++			return 0;
++		}
++		ret = ret < 0 ? ret : 0;
++		usleep_range(10000, 11000);
++	}
++	return ret < 0 ? ret : -ETIMEDOUT;
++}
++
++static void devolve_fio(struct work_struct *work)
++{
++	struct apple_hdq *h = container_of(work, struct apple_hdq, devolve.work);
++
++	mutex_lock(&h->lock);
++	if (h->com_fio) {
++		i2c_smbus_write_byte_data(h->carregador, SN2400_HDQ, 0);
++		h->com_fio = false;
++	}
++	mutex_unlock(&h->lock);
++}
++
++/* Uma transação HDQ: break + comando de leitura + 8 bits de resposta */
++static int hdq_le_byte(struct apple_hdq *h, u8 reg)
++{
++	u8 quadros[8], rx[16];
++	int i, n, valor = 0;
++
++	writel(UFCON_FIFOS | UFCON_RESET, h->base + UART_UFCON);	/* limpa sobras */
++	writel(UFCON_FIFOS, h->base + UART_UFCON);
++
++	uart_baud(h, UBRDIV_9600);			/* break */
++	writel(0x00, h->base + UART_UTXH);
++	uart_recebe(h, rx, 1, 3000);			/* eco do break, ainda a 9600 */
++	uart_baud(h, UBRDIV_57600);
++
++	for (i = 0; i < 8; i++)				/* endereço, bit 0 primeiro; bit 7 = 0 (ler) */
++		quadros[i] = ((reg & 0x7f) >> i) & 1 ? HDQ_UM : HDQ_ZERO;
++	for (i = 0; i < 8; i++)
++		writel(quadros[i], h->base + UART_UTXH);
++
++	n = uart_recebe(h, rx, 16, 10000);		/* 8 de eco + 8 da resposta */
++	if (n != 16) {
++		dev_dbg(h->di.dev, "reg 0x%02x: %d de 16 bytes\n", reg, n);
++		return -EIO;
++	}
++	for (i = 0; i < 8; i++)
++		if (rx[8 + i] >= 0xf8)			/* pulso curto = 1 */
++			valor |= BIT(i);
++	return valor;
++}
++
++/* Função de leitura que o núcleo bq27xxx chama */
++static int apple_hdq_read(struct bq27xxx_device_info *di, u8 reg, bool single)
++{
++	struct apple_hdq *h = container_of(di, struct apple_hdq, di);
++	int lo, hi, hi2, tentativas = 3, ret;
++
++	if (reg == HDQ_REG_CORRENTE)
++		return 0;
++
++	mutex_lock(&h->lock);
++	ret = pede_fio(h);
++	if (ret)
++		goto fim;
++
++	if (single) {
++		ret = hdq_le_byte(h, reg);
++		goto fim;
++	}
++	/* 16 bits: confere que a parte alta não mudou no meio da leitura */
++	hi = hdq_le_byte(h, reg + 1);
++	do {
++		lo = hdq_le_byte(h, reg);
++		hi2 = hdq_le_byte(h, reg + 1);
++		if (hi < 0 || lo < 0 || hi2 < 0) {
++			ret = -EIO;
++			goto fim;
++		}
++		if (hi2 == hi)
++			break;
++		hi = hi2;
++	} while (--tentativas);
++	ret = tentativas ? (hi << 8) | lo : -EIO;
++fim:
++	mod_delayed_work(system_wq, &h->devolve, msecs_to_jiffies(HDQ_SEGURA_MS));
++	mutex_unlock(&h->lock);
++	return ret;
++}
++
++static void apple_hdq_cleanup(void *data)
++{
++	struct apple_hdq *h = data;
++
++	bq27xxx_battery_teardown(&h->di);
++	cancel_delayed_work_sync(&h->devolve);
++	devolve_fio(&h->devolve.work);
++	put_device(&h->carregador->dev);
++}
++
++static int apple_hdq_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np;
++	struct apple_hdq *h;
++	int ret;
++
++	h = devm_kzalloc(dev, sizeof(*h), GFP_KERNEL);
++	if (!h)
++		return -ENOMEM;
++
++	h->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(h->base))
++		return PTR_ERR(h->base);
++
++	np = of_parse_phandle(dev->of_node, "apple,hdq-master", 0);
++	if (!np)
++		return dev_err_probe(dev, -EINVAL, "falta apple,hdq-master\n");
++	h->carregador = of_find_i2c_device_by_node(np);
++	of_node_put(np);
++	if (!h->carregador)
++		return -EPROBE_DEFER;		/* o carregador ainda não apareceu */
++
++	mutex_init(&h->lock);
++	INIT_DELAYED_WORK(&h->devolve, devolve_fio);
++	uart_init(h);
++
++	h->di.dev = dev;
++	h->di.chip = BQ27541;		/* mesmo mapa de registradores */
++	h->di.name = "bq27540-battery";
++	h->di.bus.read = apple_hdq_read;
++
++	ret = bq27xxx_battery_setup(&h->di);
++	if (ret) {
++		put_device(&h->carregador->dev);
++		return ret;
++	}
++	return devm_add_action_or_reset(dev, apple_hdq_cleanup, h);
++}
++
++static const struct of_device_id apple_hdq_of_match[] = {
++	{ .compatible = "apple,t7000-hdq-gauge" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, apple_hdq_of_match);
++
++static struct platform_driver apple_hdq_driver = {
++	.driver = {
++		.name = "apple-hdq-battery",
++		.of_match_table = apple_hdq_of_match,
++	},
++	.probe = apple_hdq_probe,
++};
++module_platform_driver(apple_hdq_driver);
++
++MODULE_DESCRIPTION("iPhone 6 bq27540 gas gauge over HDQ on UART5");
++MODULE_LICENSE("GPL");
