@@ -71,3 +71,6 @@ diagnostico
 ip link set lo up
 for i in 1 2 3 4 5; do [ -e /sys/class/net/usb0 ] && break; sleep 1; done
 ip addr add "$IP/24" dev usb0 2>/dev/null && ip link set usb0 up
+# Internet pelo PC (fase 3): o PC é o roteador. Só funciona depois de rodar
+# ./scripts/08-internet.sh no PC, que também ajusta o DNS.
+ip route add default via "${IP%.*}.2" 2>/dev/null

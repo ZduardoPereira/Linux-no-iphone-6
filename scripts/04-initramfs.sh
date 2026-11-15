@@ -11,6 +11,16 @@ log "Extraindo Alpine minirootfs"
 # --no-same-owner: estamos sem root; o dono vira root:root no cpio (-R 0:0)
 tar -xzf "$SRC/alpine-minirootfs.tar.gz" -C "$WORK" --no-same-owner --exclude='./dev/*'
 
+log "Pacotes extras (ARM64): $EXTRA_PKGS"
+python3 -I "$ROOT/host/apk-fetch.py" "$WORK" "$SRC/apk-cache" \
+  "$ALPINE_MIRROR/main/aarch64" "$ALPINE_MIRROR/community/aarch64" -- $EXTRA_PKGS
+
+log "Chave SSH do projeto (build/ssh/) -> /root/.ssh/authorized_keys"
+mkdir -p "$BUILD/ssh"
+[ -f "$BUILD/ssh/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C "linux-no-iphone6" -f "$BUILD/ssh/id_ed25519"
+install -d -m 700 "$WORK/root/.ssh"
+install -m 600 "$BUILD/ssh/id_ed25519.pub" "$WORK/root/.ssh/authorized_keys"
+
 log "Copiando arquivos do projeto (rootfs/ por cima do Alpine)"
 cp -a "$ROOT/rootfs/." "$WORK/"
 chmod +x "$WORK/init"

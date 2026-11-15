@@ -9,7 +9,7 @@ configura_rede() {
   local iface
   # A placa de rede do iPhone aparece no PC com o driver cdc_ncm
   iface="$(for d in /sys/class/net/*; do
-             [ "$(basename "$(readlink -f "$d/device/driver" 2>/dev/null)")" = cdc_ncm ] && basename "$d"
+             [ "$(basename "$(readlink -f "$d/device/driver" 2>/dev/null)")" = cdc_ncm ] && basename "$d" || true
            done | head -n1)"
   [ -n "$iface" ] || { echo "Placa de rede do iPhone não encontrada (ainda)."; return 1; }
   log "Configurando $iface com $HOST_IP"

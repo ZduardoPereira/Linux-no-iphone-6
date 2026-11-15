@@ -18,6 +18,10 @@ echo "=========================================="
 
 . /etc/iphone6/usb-gadget.sh
 
+# SSH (dropbear): chaves do servidor geradas na hora (-R); login só com a chave do projeto
+mkdir -p /etc/dropbear
+dropbear -R -s -E 2>/tmp/dropbear.log && echo "SSH: ./scripts/ssh.sh (root@$(cat /etc/iphone6/phone_ip))"
+
 # Shell na porta serial USB (no PC: ./scripts/07-conectar.sh)
 ( while true; do
     [ -e /dev/ttyGS0 ] && setsid sh -c 'exec /bin/sh -l </dev/ttyGS0 >/dev/ttyGS0 2>&1'

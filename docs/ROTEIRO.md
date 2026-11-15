@@ -25,29 +25,34 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
    do FIFO em vez do número do endpoint (patch `kernel/patches/0002`). Candidato a
    ser enviado ao kernel oficial.
 5. Atrapalham no PC: driver `apple_mfi_fastcharge`, `usbmuxd` e ModemManager
-   (ver `host/99-linux-no-iphone6.rules`).
+   (ver `host/70-linux-no-iphone6.rules`).
 
 ### Pendências da fase 1
 - [ ] Descobrir por que o DMA do USB falha (pongoOS antigo deixa algo configurado?)
 - [ ] Enviar o patch do `DTXFSTS` para o kernel oficial (linux-usb)
 - [ ] 2º núcleo da CPU (conferir com `nproc`)
 
-## Fase 2: Conhecer o hardware por dentro do Linux
-- [ ] Explorar `/sys`, `/proc/device-tree`, `dmesg`: o que o kernel achou?
-- [ ] Ler `t7000.dtsi` e `t7000-6.dtsi` no kernel e mapear cada nó para uma peça real
-- [ ] Testar botões (`evtest`), brilho (`/sys/class/backlight`), cpufreq
-- [ ] Ler o device tree original da Apple (o m1n1 tem acesso a ele) e comparar
+## Fase 2: Conhecer o hardware por dentro do Linux ← estamos aqui
+- [x] Explorar `/sys`, `/proc/device-tree`, `dmesg`: o que o kernel achou
+- [x] Ler o log do m1n1 (`/dev/mtd0`) e o device tree original da Apple (`/dev/mtd1`)
+- [x] Leitor do ADT (`host/adt.py`) e mapa completo em [HARDWARE.md](HARDWARE.md)
+- [x] Brilho (`/sys/class/backlight`, 0–2047) e cpufreq (300 MHz–1,39 GHz, `schedutil`)
+- [ ] Testar os botões lendo `/dev/input/event0`
+- [ ] Ler `t7000.dtsi` no kernel e comparar nó a nó com o ADT (`build/adt.txt`)
+- [ ] Investigar o 2º núcleo (IORVBAR) e o DMA do USB
 
 **Você aprende:** device tree, sysfs, drivers de plataforma, como o kernel descobre o hardware.
 
-## Fase 3: Userspace de verdade
-- [ ] Trocar o shell da tela por algo útil (ex.: mostrar IP, bateria, uptime)
-- [ ] SSH (dropbear) pela rede USB
-- [ ] Roteamento: o iPhone acessar a internet através do PC (NAT)
-- [ ] `apk add` funcionando dentro do iPhone
+## Fase 3: Userspace de verdade ← em andamento
+- [x] Internet no iPhone através do PC (NAT): `./scripts/08-internet.sh`
+- [x] `apk add` funcionando dentro do iPhone
+- [x] SSH (dropbear) pela rede USB: `./scripts/ssh.sh` (chave do projeto em `build/ssh/`)
+- [x] Pacotes ARM64 embutidos no initramfs pelo PC (`host/apk-fetch.py`, lista em `config.sh`)
+- [ ] Confirmar no próximo boot: SSH e ferramentas já presentes sem instalar nada
 - [ ] Rootfs maior via rede (NBD/NFS), já que o armazenamento interno ainda não funciona
+- [ ] Trocar o shell da tela por algo útil (ex.: mostrar IP, uptime, temperatura)
 
-**Você aprende:** init, rede Linux, NAT, root filesystem por rede.
+**Você aprende:** init, rede Linux, NAT, gerenciador de pacotes, SSH.
 
 ## Fase 4: Primeiro driver
 Escolha **uma** peça e escreva/porte o driver. Ordem sugerida, do mais fácil ao mais difícil:

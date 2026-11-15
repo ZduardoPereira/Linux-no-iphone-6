@@ -53,6 +53,9 @@ Fonte: [HoolockLinux/docs, features/A8.md](https://github.com/HoolockLinux/docs/
 ./scripts/05-empacotar.sh      # gera build/m1n1-linux.bin
 sudo ./scripts/06-boot-checkra1n.sh boot  # iPhone em DFU → Linux (funciona neste PC AMD)
 ./scripts/07-conectar.sh       # rede USB + shell no iPhone pela serial
+./scripts/08-internet.sh       # internet no iPhone através do PC (NAT)
+./scripts/ssh.sh               # SSH no iPhone (ou: ./scripts/ssh.sh 'comando')
+./scripts/iphone.sh 'comando'  # roda um comando pela serial (sem rede)
 ```
 
 Métodos alternativos de boot (não funcionaram neste PC AMD, mas são os oficiais da Hoolock):
@@ -61,7 +64,7 @@ Métodos alternativos de boot (não funcionaram neste PC AMD, mas são os oficia
 > **PCs com processador AMD:** palera1n e gaster falham logo depois do exploit; o
 > checkra1n 0.12.4 funciona. O driver `apple_mfi_fastcharge` e o `usbmuxd` também
 > atrapalham; os scripts de boot os desativam enquanto rodam. Para o ModemManager não
-> mandar "AT" no shell: `sudo cp host/99-linux-no-iphone6.rules /etc/udev/rules.d/`.
+> mandar "AT" no shell: `sudo cp host/70-linux-no-iphone6.rules /etc/udev/rules.d/`.
 > Detalhes do que foi descoberto: [docs/ROTEIRO.md](docs/ROTEIRO.md), fase 1.
 
 Primeiro teste recomendado: `./scripts/06-boot.sh m1n1` (só o m1n1, sem Linux). Se a tela

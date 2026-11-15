@@ -22,6 +22,9 @@ DOCS_RAW="https://raw.githubusercontent.com/HoolockLinux/docs/master"
 PONGOTERM_URL="https://raw.githubusercontent.com/checkra1n/pongoOS/iOS15/scripts/pongoterm.c"
 PALERA1N_URL="https://github.com/palera1n/palera1n/releases/download/v2.4/palera1n-linux-x86_64"
 IPSW_URL="https://github.com/blacktop/ipsw/releases/download/v3.1.741/ipsw_3.1.741_linux_x86_64.tar.gz"
+ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/v3.23"
+# Pacotes que vão dentro do initramfs (o iPhone ainda não tem armazenamento)
+EXTRA_PKGS="dropbear dropbear-scp openssh-sftp-server i2c-tools evtest"
 ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/alpine-minirootfs-3.23.2-aarch64.tar.gz"
 
 # --- Alvo -------------------------------------------------------------------
