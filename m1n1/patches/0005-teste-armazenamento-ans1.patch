@@ -1,0 +1,103 @@
+m1n1: teste do armazenamento do A8 (ANS1), só leitura
+
+Função ans1_teste() (não é chamada no boot: o driver do Linux já fala com o
+ANS; chamar aqui foi o teste da fase 7). Ela liga o ANS, pede identify e lê os LBAs 0..2 da área do
+usuário, procurando a tabela GPT ("EFI PART"). Resultado no log do m1n1
+(/dev/mtd0 no Linux). Corrige também o free(cmd) duplicado em ans1_shutdown.
+
+--- a/src/ans1.c
++++ b/src/ans1.c
+@@ -4,6 +4,7 @@
+ #include "ans1.h"
+ #include "assert.h"
+ #include "malloc.h"
++#include "memory.h"
+ #include "pmgr.h"
+ #include "rtkit.h"
+ #include "string.h"
+@@ -432,7 +433,6 @@
+     // For some reason rtkit_quiesce() would cause crash when startup again
+     rtkit_sleep(ans1_rtkit);
+     rtkit_free(ans1_rtkit);
+-    free(cmd);
+     free(ans1_akf);
+     free(cmd);
+ 
+@@ -442,3 +442,68 @@
+     ans1_ready = false;
+     printf("ANS1: shutdown done\n");
+ }
++
++/*
++ * Linux-no-iphone-6: teste só de leitura, chamado no boot (kboot_boot).
++ * Liga o ANS, pede a identificação da flash e lê os setores 0..2 da área do
++ * usuário. O resultado vai para o log do m1n1 (no Linux: /dev/mtd0).
++ */
++static bool ans1_teste_cmd(u8 op, u32 lba, void *buf)
++{
++    memset(buf, 0, SZ_4K);
++    dc_civac_range(buf, SZ_4K);               /* nada sujo no cache por cima do DMA */
++    memset(cmd, '\0', ANS1_CMD_SIZE);
++    cmd->op = op;
++    cmd->flags = ANS1_CMD_IO_FLAG_NO_ENCRYPTION;
++    cmd->slba = lba;
++    cmd->length = 1;
++    ((struct ans1_io *)(cmd + 1))->sgl[0] = (u64)buf >> 12;
++    dc_civac_range(cmd, ANS1_CMD_SIZE);
++    bool ok = ans1_exec_command();
++    dc_ivac_range(buf, SZ_4K);
++    return ok;
++}
++
++void ans1_teste(void)
++{
++    u8 *buf = memalign(SZ_4K, SZ_4K);
++    if (!buf)
++        return;
++    printf("ANS1-TESTE: inicio\n");
++    if (!ans1_init()) {
++        printf("ANS1-TESTE: init FALHOU\n");
++        free(buf);
++        return;
++    }
++    printf("ANS1-TESTE: rtkit protocolo %d, endpoint %d\n", rtkit_protocol_version(ans1_rtkit), ans1_ep);
++
++    if (ans1_teste_cmd(ANS1_CMD_OP_IDENTIFY, 0, buf)) {
++        struct asp_identify *id = (struct asp_identify *)buf;
++        printf("ANS1-TESTE: identify lba_formatadas=%u lba_size=%u lba_bruto=%u util=%d\n",
++               id->num_lba_formatted, id->lba_size, id->num_lba_raw, id->util_formatted);
++        hexdump(buf, 0x60);
++    } else {
++        printf("ANS1-TESTE: identify FALHOU\n");
++    }
++
++    for (u32 lba = 0; lba < 3; lba++) {
++        if (!ans1_teste_cmd(ANS1_CMD_OP_READ_USERAREA, lba, buf)) {
++            printf("ANS1-TESTE: leitura lba %u FALHOU\n", lba);
++            continue;
++        }
++        int efi = -1;
++        for (int i = 0; i + 8 <= SZ_4K; i += 8)
++            if (!memcmp(buf + i, "EFI PART", 8)) {
++                efi = i;
++                break;
++            }
++        printf("ANS1-TESTE: lba %u ok, 'EFI PART' em %d\n", lba, efi);
++        hexdump(buf, 0x40);
++        if (efi >= 0)
++            hexdump(buf + efi, 0x60);
++    }
++
++    ans1_shutdown();
++    free(buf);
++    printf("ANS1-TESTE: fim\n");
++}
+--- a/src/ans1.h
++++ b/src/ans1.h
+@@ -8,5 +8,6 @@
+ bool ans1_read_main_storage(u64 lba, void *buffer);
+ void ans1_shutdown(void);
+ bool ans1_init(void);
++void ans1_teste(void); /* Linux-no-iphone-6 */
+ 
+ #endif

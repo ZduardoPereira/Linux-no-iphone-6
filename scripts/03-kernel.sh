@@ -42,7 +42,11 @@ cp "$ROOT/kernel/iphone6.config" "$K/.iphone6.config"
 [ "${1:-}" = "menuconfig" ] && "${MK[@]}" menuconfig
 
 log "Compilando kernel (a primeira vez demora; ~10-20 min)"
-"${MK[@]}" Image.gz "apple/$DTB_NAME"
+"${MK[@]}" Image.gz "apple/$DTB_NAME" modules
+# Módulos (.ko) instalados fora do projeto (caminho sem espaços); o 04 copia para o initramfs
+MODS="$(dirname "$KSRC")/modules"
+rm -rf "$MODS"
+"${MK[@]}" -s modules_install INSTALL_MOD_PATH="$MODS" INSTALL_MOD_STRIP=1 >/dev/null
 
 cp "$K/arch/arm64/boot/Image.gz"              "$BUILD/Image.gz"
 cp "$K/arch/arm64/boot/dts/apple/$DTB_NAME"   "$BUILD/$DTB_NAME"

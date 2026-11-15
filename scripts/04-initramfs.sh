@@ -38,6 +38,12 @@ else
   echo "aviso: sem firmware do touch (rode ./scripts/09-firmware-touch.sh)"
 fi
 
+log "Módulos do kernel (.ko) -> /lib/modules"
+if [ -d "$(dirname "$KSRC")/modules/lib/modules" ]; then
+  mkdir -p "$WORK/lib/modules"
+  cp -a "$(dirname "$KSRC")/modules/lib/modules/." "$WORK/lib/modules/"
+fi
+
 log "Copiando arquivos do projeto (rootfs/ por cima do Alpine)"
 cp -a "$ROOT/rootfs/." "$WORK/"
 chmod +x "$WORK/init"

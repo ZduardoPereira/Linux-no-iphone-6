@@ -39,6 +39,11 @@ BOOTARGS="console=ttySAC0,115200 console=tty0 loglevel=7"
 BOOTARGS="$BOOTARGS dwc2.apple_pio=1"
 # Touch (fase 5): o firmware vai numa transferência SPI só (65 KB); o padrão do spidev é 4 KB
 BOOTARGS="$BOOTARGS spidev.bufsiz=131072"
+# Pânico do kernel: fica parado na tela (para fotografar) em vez de reiniciar na hora
+BOOTARGS="$BOOTARGS panic=0"
+# Flash interna (fase 7): o disco do iOS tem GPT sem o "MBR de proteção" no setor 0;
+# sem "gpt" o Linux não reconhece as partições do /dev/ans0
+BOOTARGS="$BOOTARGS gpt"
 # Rede via USB: o iPhone fica com .1 e o PC com .2
 PHONE_IP="172.16.42.1"
 HOST_IP="172.16.42.2"

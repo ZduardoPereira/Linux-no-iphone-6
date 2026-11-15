@@ -1,0 +1,836 @@
+block: apple-ans1: armazenamento interno do A7/A8 (ANS) + DTS do iPhone 6
+
+Disco de blocos sobre o coprocessador ANS (RTKit v10, endpoint 6), com o
+firmware que o iBoot deixou na RAM (descrito pelo m1n1 via alias 'asp').
+Protocolo do m1n1/HoolockLinux (src/ans1.c, proxyclient fw/ans1.py).
+Só leitura por padrão (parâmetro escrita=1 libera).
+
+diff --git b/drivers/block/apple-ans1.c b/drivers/block/apple-ans1.c
+new file mode 100644
+index 0000000..6d8d06b
+--- /dev/null
++++ b/drivers/block/apple-ans1.c
+@@ -0,0 +1,748 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Armazenamento interno dos Apple A7/A8 ("ANS1"/ASP) como disco de blocos.
++ * Linux-no-iphone-6.
++ *
++ * A flash não é NVMe nesses chips: quem cuida dela é o ANS, um coprocessador
++ * ARM com firmware próprio (carregado pelo iBoot na RAM, "pre-loaded"). O Linux
++ * conversa com ele pelo RTKit, através do mailbox AKF:
++ *
++ *   1. aponta o ANS para o firmware na RAM (registradores REMAP) e dá a partida;
++ *   2. RTKit: HELLO, mapa de endpoints, liga o endpoint do armazenamento (6 na v10);
++ *   3. o ANS avisa "pronto" (tag 254); entregamos o buffer de comandos (tag 253);
++ *   4. cada comando de 0x30 bytes + lista de páginas de 4 KB vai no buffer; a
++ *      "campainha" (SQ_DB) avisa o ANS, que responde COMPLETE com tag e status.
++ *
++ * Protocolo descoberto pela HoolockLinux: m1n1 src/ans1.c e
++ * proxyclient/m1n1/fw/ans1.py (licença MIT).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/blk-mq.h>
++#include <linux/blkdev.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/highmem.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/scatterlist.h>
++#include <linux/soc/apple/rtkit.h>
++#include <linux/vmalloc.h>
++
++/* registradores do IOP (AKF), a partir do reg 0 */
++#define AKF_REMAP_PHYS_LO	0x08
++#define AKF_REMAP_PHYS_HI	0x0c
++#define AKF_REMAP_IOVA_LO	0x10
++#define AKF_REMAP_IOVA_HI	0x14
++#define AKF_REMAP_SIZE_LO	0x18
++#define AKF_REMAP_SIZE_HI	0x1c
++#define AKF_ENDIANNESS		0x20	/* 1 = little endian */
++#define AKF_CPU_CONTROL		0x28
++#define AKF_CPU_CONTROL_START	BIT(4)
++#define AKF_UNK_80C		0x80c
++
++/* mensagens no endpoint do armazenamento */
++#define ANS1_MSG_TYPE		GENMASK_ULL(3, 0)
++#define ANS1_MSG_SET_CMDBUF	0
++#define ANS1_MSG_SET_TAG	1
++#define ANS1_MSG_COMPLETE	2
++#define ANS1_MSG_SQ_DB		3
++#define ANS1_MSG_UNK4		4
++#define ANS1_CMDBUF_BASE	GENMASK_ULL(55, 16)
++#define ANS1_CMDBUF_SIZE_17_6	GENMASK_ULL(15, 4)
++#define ANS1_TAG_SIZE_17_6	GENMASK_ULL(35, 24)
++#define ANS1_TAG_OFF_17_6	GENMASK_ULL(23, 12)
++#define ANS1_TAG_TAG		GENMASK_ULL(7, 4)
++#define ANS1_SQ_DB_OP		GENMASK_ULL(19, 12)
++#define ANS1_SQ_DB_OP_RING	0xff
++#define ANS1_SQ_DB_TAG		GENMASK_ULL(7, 4)
++#define ANS1_DONE_STATUS	GENMASK_ULL(15, 12)
++#define ANS1_DONE_TAG		GENMASK_ULL(11, 4)
++#define ANS1_STATUS_OK		0
++#define ANS1_STATUS_INIT	0xa	/* resposta das tags especiais */
++#define ANS1_TAG_READY		254	/* o ANS manda sozinho depois de ligar o endpoint */
++#define ANS1_TAG_CMDBUF_READY	253	/* resposta do SET_CMDBUF */
++
++/* comandos */
++#define ANS1_OP_IDENTIFY	0x00
++#define ANS1_OP_READ		0x10	/* "UserArea" = o disco principal */
++#define ANS1_OP_WRITE		0x11
++#define ANS1_OP_WRITE_UNLOCK	0x19
++#define ANS1_OP_INIT_R		0x72	/* o iBoot manda depois do identify */
++#define ANS1_OP_POWER_CONFIG	0x80
++#define ANS1_FLAG_NO_ENCRYPTION	BIT(3)	/* sem isso o AES em linha embaralha os dados */
++
++struct ans1_cmd_hdr {
++	u8 op;
++	u8 tag;
++	__le16 flags;
++	__le32 slba;
++	__le32 length;		/* em páginas de 4 KB */
++	u8 pad[0x24];
++	__le32 pages[];		/* número da página física (endereço >> 12) */
++} __packed;
++static_assert(sizeof(struct ans1_cmd_hdr) == 0x30);
++
++#define ANS1_PAGE		SZ_4K
++#define ANS1_MAX_PAGES		256	/* 1 MB por comando */
++#define ANS1_CMD_SIZE		ALIGN(0x30 + ANS1_MAX_PAGES * 4, 64)
++#define ANS1_MAX_TAGS		16
++#define ANS1_TIMEOUT		(5 * HZ)
++
++static unsigned int ntags = 1;
++module_param(ntags, uint, 0444);
++MODULE_PARM_DESC(ntags, "comandos simultâneos no ANS (1..16)");
++
++static bool escrita;
++module_param(escrita, bool, 0444);
++MODULE_PARM_DESC(escrita, "permite ESCREVER na flash (padrão: só leitura)");
++
++/*
++ * DADOS SEMPRE POR BUFFER INTERMEDIÁRIO SEM CACHE ("bounce").
++ * Medido no iPhone 6: o ANS escreve na RAM por um caminho que NÃO passa pelo cache
++ * do lado da memória (o de 4 MB do A8). A manutenção de cache do ARM (dc civac/ivac,
++ * que o Linux faz no dma_map/unmap) não alcança esse cache: se ele tem uma cópia
++ * da página (ex.: o programa acabou de preencher o buffer), a CPU lê a cópia velha
++ * e depois ela volta para a RAM por cima dos dados. Resultado: 0/40 leituras certas
++ * num buffer recém-escrito, 40/40 depois de varrer 8 MB para expulsar o cache.
++ * Memória SEM cache (como o buffer de comandos) funciona nos dois sentidos; então
++ * o ANS só fala com buffers sem cache e o driver copia para as páginas do Linux.
++ * (O mesmo deve explicar o DMA do USB, que nunca funcionou neste iPhone.)
++ */
++static bool varre = true;	/* até entendermos o cache do MCC: sem isso os dados vêm velhos */
++module_param(varre, bool, 0644);
++MODULE_PARM_DESC(varre, "varre 8 MB antes de ler respostas/dados do ANS (contorna o cache do lado da memória; padrão: sim)");
++static u8 *varre_buf;
++#define VARRE_TAM (8 << 20)
++
++/* expulsa os caches (CPU e lado da memória) lendo e escrevendo 8 MB de outra memória */
++static void ans1_varre(void)
++{
++	if (!varre || !varre_buf)
++		return;
++	for (size_t i = 0; i < VARRE_TAM; i += 64)
++		WRITE_ONCE(varre_buf[i], READ_ONCE(varre_buf[i]) + 1);
++}
++
++static bool depura;
++module_param(depura, bool, 0644);
++MODULE_PARM_DESC(depura, "registra cada comando e o começo dos dados lidos");
++
++static bool init_iboot = true;
++module_param(init_iboot, bool, 0444);
++MODULE_PARM_DESC(init_iboot, "manda a configuração de energia que o iBoot manda (A8)");
++
++struct ans1_rq {
++	blk_status_t status;
++};
++
++struct ans1 {
++	struct device *dev;
++	void __iomem *cpu;
++	struct apple_rtkit *rtk;
++	u8 ep;
++
++	void *cmdbuf;
++	dma_addr_t cmdbuf_dma;
++	void *bounce;			/* ANS1_MAX_PAGES páginas por tag, sem cache */
++	dma_addr_t bounce_dma;
++
++	struct completion ready, cmdbuf_ready;
++
++	/* comandos internos (identify, configuração), só antes do disco existir */
++	bool sync_pending;
++	struct completion sync_done;
++	u8 sync_status;
++
++	struct blk_mq_tag_set tagset;
++	struct gendisk *disk;
++	bool morto;			/* o firmware travou: tudo falha até recarregar */
++	u64 nr_lba;
++	u32 lba_size;
++};
++
++static struct ans1_cmd_hdr *ans1_cmd(struct ans1 *ans, unsigned int tag)
++{
++	return ans->cmdbuf + tag * ANS1_CMD_SIZE;
++}
++
++static int ans1_send(struct ans1 *ans, u64 msg, bool atomic)
++{
++	return apple_rtkit_send_message(ans->rtk, ans->ep, msg, NULL, atomic);
++}
++
++static int ans1_ring(struct ans1 *ans, unsigned int tag, bool atomic)
++{
++	/*
++	 * O comando tem que ESTAR na RAM antes da campainha. dma_wmb() só ordena; com
++	 * ele o ANS às vezes lia o comando anterior (identify zerado, leituras "atrasadas
++	 * em um"). Ler de volta + wmb() (dsb st) esvazia o buffer de escrita.
++	 */
++	READ_ONCE(ans1_cmd(ans, tag)->length);
++	wmb();
++	return ans1_send(ans, FIELD_PREP(ANS1_SQ_DB_OP, ANS1_SQ_DB_OP_RING) |
++			      FIELD_PREP(ANS1_SQ_DB_TAG, tag) |
++			      FIELD_PREP(ANS1_MSG_TYPE, ANS1_MSG_SQ_DB), atomic);
++}
++
++/* ---------- respostas do ANS (chamado pelo RTKit, fora de interrupção) ---------- */
++static void ans1_recv(void *cookie, u8 ep, u64 msg)
++{
++	struct ans1 *ans = cookie;
++	unsigned int type = FIELD_GET(ANS1_MSG_TYPE, msg);
++	unsigned int tag = FIELD_GET(ANS1_DONE_TAG, msg);
++	unsigned int status = FIELD_GET(ANS1_DONE_STATUS, msg);
++	struct request *rq;
++
++	/*
++	 * O RTKit abre o endpoint ainda durante o boot (early_app_endpoints), e o
++	 * "pronto" (tag 254) chega antes de sabermos o número: adota o primeiro.
++	 */
++	if (!ans->ep)
++		ans->ep = ep;
++	if (ep != ans->ep) {
++		dev_warn(ans->dev, "mensagem no endpoint %u: 0x%llx\n", ep, msg);
++		return;
++	}
++	if (type == ANS1_MSG_UNK4)
++		return;
++	if (type != ANS1_MSG_COMPLETE) {
++		dev_warn(ans->dev, "mensagem desconhecida 0x%llx\n", msg);
++		return;
++	}
++
++	if (tag == ANS1_TAG_READY) {
++		complete(&ans->ready);
++		return;
++	}
++	if (tag == ANS1_TAG_CMDBUF_READY) {
++		complete(&ans->cmdbuf_ready);
++		return;
++	}
++	if (ans->sync_pending && tag == 0) {
++		ans->sync_status = status;
++		ans->sync_pending = false;
++		complete(&ans->sync_done);
++		return;
++	}
++	if (!ans->disk || tag >= ntags) {
++		dev_warn(ans->dev, "resposta para tag %u inesperada (0x%llx)\n", tag, msg);
++		return;
++	}
++
++	rq = blk_mq_tag_to_rq(ans->tagset.tags[0], tag);
++	if (!rq) {
++		dev_warn(ans->dev, "tag %u sem pedido\n", tag);
++		return;
++	}
++	if (depura)
++		dev_info(ans->dev, "resposta 0x%llx (tag %u status %u)\n", msg, tag, status);
++	if (status != ANS1_STATUS_OK)
++		dev_err_ratelimited(ans->dev, "%s no setor %llu falhou: status %u\n",
++				    rq_data_dir(rq) ? "escrita" : "leitura",
++				    blk_rq_pos(rq) >> 3, status);
++	((struct ans1_rq *)blk_mq_rq_to_pdu(rq))->status =
++		status == ANS1_STATUS_OK ? BLK_STS_OK : BLK_STS_IOERR;
++	blk_mq_complete_request(rq);
++}
++
++static void ans1_crashed(void *cookie, const void *crashlog, size_t size)
++{
++	struct ans1 *ans = cookie;
++
++	WRITE_ONCE(ans->morto, true);
++	dev_err(ans->dev, "o firmware do ANS travou (crashlog de %zu bytes); "
++		"os pedidos vão falhar até recarregar o driver\n", size);
++}
++
++static const struct apple_rtkit_ops ans1_rtkit_ops = {
++	.early_app_endpoints = true,	/* senão o ANS não termina de ligar */
++	.crashed = ans1_crashed,
++	.recv_message = ans1_recv,
++};
++
++/* ---------- comandos internos, síncronos (tag 0, antes do add_disk) ---------- */
++struct ans1_campo {
++	u16 off;
++	u32 val;
++};
++
++static int ans1_sync(struct ans1 *ans, u8 op, u16 flags,
++		     const struct ans1_campo *campos, int n)
++{
++	struct ans1_cmd_hdr *cmd = ans1_cmd(ans, 0);
++	int ret, i;
++
++	memset(cmd, 0, ANS1_CMD_SIZE);
++	cmd->op = op;
++	cmd->flags = cpu_to_le16(flags);
++	for (i = 0; i < n; i++)
++		*(__le32 *)((u8 *)cmd + campos[i].off) = cpu_to_le32(campos[i].val);
++
++	reinit_completion(&ans->sync_done);
++	ans->sync_pending = true;
++	ret = ans1_ring(ans, 0, false);
++	if (ret)
++		return ret;
++	if (!wait_for_completion_timeout(&ans->sync_done, ANS1_TIMEOUT)) {
++		ans->sync_pending = false;
++		dev_err(ans->dev, "comando 0x%02x sem resposta\n", op);
++		return -ETIMEDOUT;
++	}
++	if (ans->sync_status != ANS1_STATUS_OK) {
++		dev_warn(ans->dev, "comando 0x%02x: status %u\n", op, ans->sync_status);
++		return -EIO;
++	}
++	dma_rmb();
++	return 0;
++}
++
++/* o que o iBoot manda depois do identify nos chips depois do A7 (ans1.py: cmd_init) */
++static void ans1_init_iboot(struct ans1 *ans)
++{
++	static const struct ans1_campo p1[] = {
++		{ 0x38, 0x2a }, { 0x44, 0x400000 }, { 0x48, 0x400000 } };
++	static const struct ans1_campo p2[] = {
++		{ 0x38, 0x13 }, { 0x3c, 0x3 }, { 0x44, 0x2 }, { 0x48, 0x2 }, { 0x4c, 0x4 },
++		{ 0x50, 0x2 }, { 0x54, 0x4 }, { 0x58, 0x4 }, { 0x5c, 0x2 }, { 0x60, 0x2 } };
++	static const struct ans1_campo p3[] = {
++		{ 0x38, 0x25 }, { 0x3c, 0x3 }, { 0x44, 0x1 }, { 0x48, 0x1 }, { 0x4c, 0x1 },
++		{ 0x50, 0x1 }, { 0x54, 0x1 }, { 0x58, 0x1 }, { 0x5c, 0x1 }, { 0x60, 0x1 } };
++	static const struct ans1_campo alta[] = { { 0x38, 0x26 }, { 0x44, 0x1 } };
++
++	ans1_sync(ans, ANS1_OP_INIT_R, 0, NULL, 0);
++	ans1_sync(ans, ANS1_OP_POWER_CONFIG, 0, p1, ARRAY_SIZE(p1));
++	ans1_sync(ans, ANS1_OP_POWER_CONFIG, 0, p2, ARRAY_SIZE(p2));
++	ans1_sync(ans, ANS1_OP_POWER_CONFIG, 0, p3, ARRAY_SIZE(p3));
++	ans1_sync(ans, ANS1_OP_POWER_CONFIG, 0, alta, ARRAY_SIZE(alta)); /* "alta potência" */
++}
++
++/* ---------- caminho de E/S (blk-mq) ---------- */
++static void *ans1_bounce(struct ans1 *ans, unsigned int tag)
++{
++	return ans->bounce + (size_t)tag * ANS1_MAX_PAGES * ANS1_PAGE;
++}
++
++static blk_status_t ans1_queue_rq(struct blk_mq_hw_ctx *hctx,
++				  const struct blk_mq_queue_data *bd)
++{
++	struct request *rq = bd->rq;
++	struct ans1 *ans = hctx->queue->queuedata;
++	struct ans1_rq *arq = blk_mq_rq_to_pdu(rq);
++	struct ans1_cmd_hdr *cmd = ans1_cmd(ans, rq->tag);
++	dma_addr_t b = ans->bounce_dma + (dma_addr_t)rq->tag * ANS1_MAX_PAGES * ANS1_PAGE;
++	unsigned int bytes = blk_rq_bytes(rq), npag = bytes / ANS1_PAGE, i;
++	u8 op;
++
++	if (READ_ONCE(ans->morto))
++		return BLK_STS_IOERR;
++
++	switch (req_op(rq)) {
++	case REQ_OP_READ:
++		op = ANS1_OP_READ;
++		break;
++	case REQ_OP_WRITE:
++		if (!escrita)
++			return BLK_STS_IOERR;
++		op = ANS1_OP_WRITE;
++		break;
++	case REQ_OP_FLUSH:	/* não anunciamos cache de escrita; nada a fazer */
++		blk_mq_start_request(rq);
++		blk_mq_end_request(rq, BLK_STS_OK);
++		return BLK_STS_OK;
++	default:
++		return BLK_STS_NOTSUPP;
++	}
++	if (!npag || bytes % ANS1_PAGE || npag > ANS1_MAX_PAGES) {
++		dev_err_ratelimited(ans->dev, "pedido fora do formato (%u bytes)\n", bytes);
++		return BLK_STS_IOERR;
++	}
++
++	if (op == ANS1_OP_WRITE) {	/* dados do Linux -> buffer sem cache */
++		struct req_iterator it;
++		struct bio_vec bv;
++		char *d = ans1_bounce(ans, rq->tag);
++
++		rq_for_each_segment(bv, rq, it) {
++			memcpy_from_bvec(d, &bv);
++			d += bv.bv_len;
++		}
++	}
++
++	memset(cmd, 0, ANS1_CMD_SIZE);
++	for (i = 0; i < npag; i++)
++		cmd->pages[i] = cpu_to_le32((b + i * ANS1_PAGE) >> 12);
++	cmd->op = op;
++	cmd->tag = rq->tag;
++	cmd->flags = cpu_to_le16(ANS1_FLAG_NO_ENCRYPTION);
++	cmd->slba = cpu_to_le32(blk_rq_pos(rq) >> 3);	/* setores de 512 -> LBAs de 4 KB */
++	cmd->length = cpu_to_le32(npag);
++
++	if (depura)
++		dev_info(ans->dev, "cmd tag %u: op %#x slba %u len %u\n",
++			 cmd->tag, cmd->op, le32_to_cpu(cmd->slba), npag);
++	arq->status = BLK_STS_OK;
++	blk_mq_start_request(rq);
++	if (ans1_ring(ans, rq->tag, true)) {
++		/* ANS travado: erro de verdade, senão o bloco fica reenviando para sempre */
++		if (apple_rtkit_is_crashed(ans->rtk)) {
++			WRITE_ONCE(ans->morto, true);
++			blk_mq_end_request(rq, BLK_STS_IOERR);
++			return BLK_STS_OK;
++		}
++		return BLK_STS_RESOURCE;
++	}
++	return BLK_STS_OK;
++}
++
++static void ans1_complete(struct request *rq)
++{
++	struct ans1 *ans = rq->q->queuedata;
++	struct ans1_rq *arq = blk_mq_rq_to_pdu(rq);
++
++	if (req_op(rq) == REQ_OP_READ && arq->status == BLK_STS_OK) {
++		struct req_iterator it;
++		struct bio_vec bv;
++		const char *o = ans1_bounce(ans, rq->tag);
++
++		dma_rmb();
++		ans1_varre();
++		rq_for_each_segment(bv, rq, it) {	/* buffer sem cache -> páginas do Linux */
++			memcpy_to_bvec(&bv, o);
++			o += bv.bv_len;
++		}
++		if (depura)
++			dev_info(ans->dev, "fim tag %d: %*ph\n", rq->tag, 16,
++				 (u8 *)ans1_bounce(ans, rq->tag));
++	}
++	blk_mq_end_request(rq, arq->status);
++}
++
++static enum blk_eh_timer_return ans1_timeout(struct request *rq)
++{
++	struct ans1 *ans = rq->q->queuedata;
++
++	dev_err(ans->dev, "tag %d (setor %llu) sem resposta do ANS\n", rq->tag, blk_rq_pos(rq));
++	((struct ans1_rq *)blk_mq_rq_to_pdu(rq))->status = BLK_STS_TIMEOUT;
++	blk_mq_complete_request(rq);
++	return BLK_EH_DONE;
++}
++
++static const struct blk_mq_ops ans1_mq_ops = {
++	.queue_rq = ans1_queue_rq,
++	.complete = ans1_complete,
++	.timeout = ans1_timeout,
++};
++
++static const struct block_device_operations ans1_fops = {
++	.owner = THIS_MODULE,
++};
++
++/* ---------- partida ---------- */
++
++/* o m1n1 descreve o firmware que o iBoot deixou na RAM num nó reserved-memory */
++static int ans1_fw_region(struct ans1 *ans, u64 *phys, u64 *iova, u64 *size)
++{
++	struct device_node *rmem, *np;
++	int ret = -ENOENT;
++
++	rmem = of_find_node_by_path("/reserved-memory");
++	if (!rmem)
++		return ret;
++	for_each_child_of_node(rmem, np) {
++		const __be32 *p;
++		struct resource r;
++		int len;
++
++		if (!of_device_is_compatible(np, "apple,iop-mem"))
++			continue;
++		p = of_get_property(np, "iommu-addresses", &len);
++		if (!p || len < 5 * 4 || be32_to_cpup(p) != ans->dev->of_node->phandle)
++			continue;
++		if (of_address_to_resource(np, 0, &r))
++			continue;
++		*phys = r.start;
++		*iova = of_read_number(p + 1, 2);
++		*size = of_read_number(p + 3, 2);
++		ret = 0;
++		of_node_put(np);
++		break;
++	}
++	of_node_put(rmem);
++	return ret;
++}
++
++static void ans1_cpu_stop(struct ans1 *ans)
++{
++	writel(readl(ans->cpu + AKF_CPU_CONTROL) & ~AKF_CPU_CONTROL_START,
++	       ans->cpu + AKF_CPU_CONTROL);
++}
++
++/* estado do IOP e das filas do mailbox (reg+0x1000), para quando algo não responde */
++static void ans1_diag(struct ans1 *ans, const char *quando)
++{
++	struct resource *r = platform_get_resource(to_platform_device(ans->dev), IORESOURCE_MEM, 0);
++	void __iomem *mb = r ? ioremap(r->start + 0x1000, 0x1000) : NULL;
++
++	dev_info(ans->dev, "diag (%s): cpu_control=%#x remap phys=%#x%08x size=%#x",
++		 quando, readl(ans->cpu + AKF_CPU_CONTROL), readl(ans->cpu + AKF_REMAP_PHYS_HI),
++		 readl(ans->cpu + AKF_REMAP_PHYS_LO), readl(ans->cpu + AKF_REMAP_SIZE_LO));
++	if (mb) {
++		dev_info(ans->dev, "diag (%s): a2i_ctl=%#x i2a_ctl=%#x (bit17 = fila vazia)\n",
++			 quando, readl(mb + 0x08), readl(mb + 0x20));
++		iounmap(mb);
++	}
++}
++
++/* deixa o ANS como o iBoot deixa: dormindo de forma limpa e com a CPU parada */
++static void ans1_dorme(struct ans1 *ans)
++{
++	int ret = apple_rtkit_shutdown(ans->rtk);
++
++	if (ret) {
++		dev_warn(ans->dev, "o ANS não confirmou que dormiu (%d); a CPU fica ligada\n", ret);
++		return;
++	}
++	ans1_cpu_stop(ans);
++	dev_info(ans->dev, "ANS dormindo, CPU parada\n");
++}
++
++static int ans1_boot(struct ans1 *ans)
++{
++	u64 phys, iova, size;
++	int ret;
++
++	ret = ans1_fw_region(ans, &phys, &iova, &size);
++	if (ret)
++		return dev_err_probe(ans->dev, ret,
++				     "sem o firmware do ANS (o m1n1 passa ele pelo alias 'asp')\n");
++	dev_info(ans->dev, "firmware do iBoot em %#llx (%#llx bytes)\n", phys, size);
++
++	writel(lower_32_bits(iova), ans->cpu + AKF_REMAP_IOVA_LO);
++	writel(upper_32_bits(iova), ans->cpu + AKF_REMAP_IOVA_HI);
++	writel(lower_32_bits(phys), ans->cpu + AKF_REMAP_PHYS_LO);
++	writel(upper_32_bits(phys), ans->cpu + AKF_REMAP_PHYS_HI);
++	writel(lower_32_bits(size), ans->cpu + AKF_REMAP_SIZE_LO);
++	writel(upper_32_bits(size), ans->cpu + AKF_REMAP_SIZE_HI);
++	writel(1, ans->cpu + AKF_ENDIANNESS);
++	writel(0, ans->cpu + AKF_UNK_80C);
++
++	/*
++	 * Ciclo do m1n1 (e do iBoot): dormir (AP quieto + IOP dormindo, com
++	 * confirmação) e SÓ ENTÃO parar a CPU; daí a partida funciona. Parar a CPU
++	 * no meio do uso deixa o __DATA do firmware inconsistente e ele trava
++	 * ("anc_queue.c:62 assert failed: Queue underflow"). O iBoot e o nosso
++	 * remove() deixam a CPU parada; se ela está rodando, alguém a deixou ligada.
++	 */
++	if (readl(ans->cpu + AKF_CPU_CONTROL) & AKF_CPU_CONTROL_START) {
++		dev_info(ans->dev, "a CPU do ANS já está rodando: pondo para dormir antes\n");
++		ret = apple_rtkit_shutdown(ans->rtk);
++		if (ret)
++			dev_warn(ans->dev, "o ANS não confirmou que dormiu (%d); tentando assim mesmo\n",
++				 ret);
++		ans1_cpu_stop(ans);
++	}
++	writel(readl(ans->cpu + AKF_CPU_CONTROL) | AKF_CPU_CONTROL_START,
++	       ans->cpu + AKF_CPU_CONTROL);
++
++	/* como o m1n1: logo depois da partida, "acorde" (INIT); ele responde HELLO */
++	reinit_completion(&ans->ready);
++	ret = apple_rtkit_wake(ans->rtk);
++	if (ret) {
++		ans1_diag(ans, "falhou");
++		return dev_err_probe(ans->dev, ret, "RTKit não subiu\n");
++	}
++
++	/* o endpoint já foi ligado pelo RTKit (early_app_endpoints) */
++	if (!ans->ep)
++		ans->ep = apple_rtkit_app_ep_to_ep(ans->rtk, 0);
++	if (!wait_for_completion_timeout(&ans->ready, ANS1_TIMEOUT))
++		return dev_err_probe(ans->dev, -ETIMEDOUT, "o ANS não ficou pronto\n");
++
++	ret = ans1_send(ans, FIELD_PREP(ANS1_CMDBUF_BASE, ans->cmdbuf_dma) |
++			     FIELD_PREP(ANS1_CMDBUF_SIZE_17_6, (ntags * ANS1_CMD_SIZE) >> 6) |
++			     FIELD_PREP(ANS1_MSG_TYPE, ANS1_MSG_SET_CMDBUF), false);
++	if (ret)
++		return ret;
++	if (!wait_for_completion_timeout(&ans->cmdbuf_ready, ANS1_TIMEOUT))
++		return dev_err_probe(ans->dev, -ETIMEDOUT, "o ANS não aceitou o buffer\n");
++
++	for (unsigned int t = 0; t < ntags; t++) {
++		ret = ans1_send(ans, FIELD_PREP(ANS1_TAG_TAG, t) |
++				     FIELD_PREP(ANS1_TAG_OFF_17_6, (t * ANS1_CMD_SIZE) >> 6) |
++				     FIELD_PREP(ANS1_TAG_SIZE_17_6, ANS1_CMD_SIZE >> 6) |
++				     FIELD_PREP(ANS1_MSG_TYPE, ANS1_MSG_SET_TAG), false);
++		if (ret)
++			return ret;
++	}
++	dev_info(ans->dev, "ANS pronto (endpoint %u, %u tag(s))\n", ans->ep, ntags);
++	return 0;
++}
++
++static int ans1_identify(struct ans1 *ans)
++{
++	u32 *r = (u32 *)ans1_cmd(ans, 0);
++	int ret;
++
++	/*
++	 * A resposta volta no próprio buffer de comando, mas às vezes chega pela
++	 * metade (só +0x48 preenchido): mesmo problema de cache do lado da memória
++	 * dos dados. Tenta de novo algumas vezes.
++	 */
++	for (int t = 0; t < 8; t++) {
++		ret = ans1_sync(ans, ANS1_OP_IDENTIFY, 0, NULL, 0);
++		if (ret)
++			return ret;
++		ans1_varre();
++		ans->nr_lba = le32_to_cpu(READ_ONCE(r[0x30 / 4]));
++		ans->lba_size = le32_to_cpu(READ_ONCE(r[0x34 / 4]));
++		if (ans->nr_lba && ans->lba_size)
++			break;
++		dev_info(ans->dev, "identify veio incompleto (tentativa %d)\n", t + 1);
++		msleep(20);
++	}
++	dev_info(ans->dev, "flash: %llu blocos de %u bytes = %llu MB (%u blocos brutos)\n",
++		 ans->nr_lba, ans->lba_size, (ans->nr_lba * ans->lba_size) >> 20,
++		 le32_to_cpu(r[0x48 / 4]));
++	if (!ans->nr_lba || ans->lba_size != ANS1_PAGE) {
++		print_hex_dump(KERN_ERR, "identify: ", DUMP_PREFIX_OFFSET, 16, 4, r, 0x80, false);
++		return -ENODEV;
++	}
++	return 0;
++}
++
++static int ans1_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct queue_limits lim = {
++		.logical_block_size = ANS1_PAGE,
++		.physical_block_size = ANS1_PAGE,
++		.io_min = ANS1_PAGE,
++		.max_hw_sectors = ANS1_MAX_PAGES * (ANS1_PAGE >> SECTOR_SHIFT),
++		.max_segments = ANS1_MAX_PAGES,
++	};
++	struct ans1 *ans;
++	int ret;
++
++	if (ntags < 1 || ntags > ANS1_MAX_TAGS)
++		return dev_err_probe(dev, -EINVAL, "ntags precisa ser 1..%d\n", ANS1_MAX_TAGS);
++
++	ans = devm_kzalloc(dev, sizeof(*ans), GFP_KERNEL);
++	if (!ans)
++		return -ENOMEM;
++	ans->dev = dev;
++	platform_set_drvdata(pdev, ans);
++	init_completion(&ans->ready);
++	init_completion(&ans->cmdbuf_ready);
++	init_completion(&ans->sync_done);
++
++	/* sem IOMMU: o ANS usa endereços físicos; a lista de páginas tem 32 bits (<< 12) */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(44));
++	if (ret)
++		return ret;
++
++	ans->cpu = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(ans->cpu))
++		return PTR_ERR(ans->cpu);
++
++	ans->cmdbuf = dmam_alloc_coherent(dev, ntags * ANS1_CMD_SIZE, &ans->cmdbuf_dma,
++					  GFP_KERNEL);
++	if (!ans->cmdbuf)
++		return -ENOMEM;
++	if (varre && !varre_buf)
++		varre_buf = vzalloc(VARRE_TAM);
++	ans->bounce = dmam_alloc_coherent(dev, (size_t)ntags * ANS1_MAX_PAGES * ANS1_PAGE,
++					  &ans->bounce_dma, GFP_KERNEL);
++	if (!ans->bounce)
++		return dev_err_probe(dev, -ENOMEM, "sem memória para os buffers sem cache\n");
++
++	ans->rtk = devm_apple_rtkit_init(dev, ans, NULL, 0, &ans1_rtkit_ops);
++	if (IS_ERR(ans->rtk))
++		return dev_err_probe(dev, PTR_ERR(ans->rtk), "RTKit/mailbox\n");
++
++	ret = ans1_boot(ans);
++	if (ret) {
++		/* não deixa o ANS ligado e escrevendo log em buffers que vão ser liberados */
++		if (apple_rtkit_is_running(ans->rtk))
++			ans1_dorme(ans);
++		return ret;
++	}
++	ret = ans1_identify(ans);
++	if (ret)
++		goto desliga;
++	if (init_iboot)
++		ans1_init_iboot(ans);
++	if (escrita && ans1_sync(ans, ANS1_OP_WRITE_UNLOCK, 0, NULL, 0))
++		dev_warn(dev, "WRITE_UNLOCK recusado\n");
++
++	ans->tagset.ops = &ans1_mq_ops;
++	ans->tagset.nr_hw_queues = 1;
++	ans->tagset.queue_depth = ntags;
++	ans->tagset.numa_node = NUMA_NO_NODE;
++	ans->tagset.cmd_size = sizeof(struct ans1_rq);
++	ans->tagset.timeout = ANS1_TIMEOUT;
++	ans->tagset.driver_data = ans;
++	ret = blk_mq_alloc_tag_set(&ans->tagset);
++	if (ret)
++		goto desliga;
++
++	ans->disk = blk_mq_alloc_disk(&ans->tagset, &lim, ans);
++	if (IS_ERR(ans->disk)) {
++		ret = PTR_ERR(ans->disk);
++		ans->disk = NULL;
++		goto tagset;
++	}
++	strscpy(ans->disk->disk_name, "ans0", DISK_NAME_LEN);
++	ans->disk->fops = &ans1_fops;
++	ans->disk->private_data = ans;
++	/* minors = 0: sem major próprio, o kernel escolhe os números (partições incluídas) */
++	set_capacity(ans->disk, ans->nr_lba * (ANS1_PAGE >> SECTOR_SHIFT));
++	set_disk_ro(ans->disk, !escrita);
++
++	ret = add_disk(ans->disk);
++	if (ret)
++		goto disco;
++	dev_info(dev, "disco ans0 pronto (%s)\n", escrita ? "LEITURA E ESCRITA" : "só leitura");
++	return 0;
++
++disco:
++	put_disk(ans->disk);
++	ans->disk = NULL;
++tagset:
++	blk_mq_free_tag_set(&ans->tagset);
++desliga:
++	ans1_dorme(ans);
++	return ret;
++}
++
++static void ans1_remove(struct platform_device *pdev)
++{
++	struct ans1 *ans = platform_get_drvdata(pdev);
++
++	del_gendisk(ans->disk);
++	put_disk(ans->disk);
++	blk_mq_free_tag_set(&ans->tagset);
++	ans1_dorme(ans);
++}
++
++static const struct of_device_id ans1_of_match[] = {
++	{ .compatible = "apple,ans1" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, ans1_of_match);
++
++static struct platform_driver ans1_driver = {
++	.driver = {
++		.name = "apple-ans1",
++		.of_match_table = ans1_of_match,
++	},
++	.probe = ans1_probe,
++	.remove = ans1_remove,
++};
++module_platform_driver(ans1_driver);
++
++MODULE_DESCRIPTION("Armazenamento interno Apple A7/A8 (ANS1) - Linux-no-iphone-6");
++MODULE_LICENSE("Dual MIT/GPL");
+diff --git a/drivers/block/Kconfig b/drivers/block/Kconfig
+index 858320b..0cb4b22 100644
+--- a/drivers/block/Kconfig
++++ b/drivers/block/Kconfig
+@@ -372,4 +372,14 @@ config BLK_DEV_ZONED_LOOP
+ 
+ 	  If unsure, say N.
+ 
++config BLK_DEV_APPLE_ANS1
++	tristate "Apple A7/A8 internal storage (ANS1)"
++	depends on ARCH_APPLE || COMPILE_TEST
++	depends on APPLE_RTKIT
++	help
++	  Internal flash of Apple A7/A8 devices (iPhone 5s/6, iPad Air 2...),
++	  driven through the ANS coprocessor ("ASP") over RTKit. Firmware is
++	  preloaded by iBoot and described to Linux by m1n1. Read-only unless
++	  the "escrita" module parameter is set.
++
+ endif # BLK_DEV
+diff --git a/drivers/block/Makefile b/drivers/block/Makefile
+index 2d8096e..6a16f43 100644
+--- a/drivers/block/Makefile
++++ b/drivers/block/Makefile
+@@ -39,5 +39,6 @@ obj-$(CONFIG_BLK_DEV_RUST_NULL) += rnull/
+ 
+ obj-$(CONFIG_BLK_DEV_UBLK)			+= ublk_drv.o
+ obj-$(CONFIG_BLK_DEV_ZONED_LOOP) += zloop.o
++obj-$(CONFIG_BLK_DEV_APPLE_ANS1) += apple-ans1.o
+ 
+ swim_mod-y	:= swim.o swim_asm.o
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index a4f0ab4..07749e4 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -15,6 +15,7 @@
+ 
+ 	aliases {
+ 		touchbar0 = &touchscreen;	/* o m1n1 copia a calibração do touch para cá */
++		asp = &ans;			/* o m1n1 descreve aqui o firmware do ANS */
+ 	};
+ 
+ 	/* Clock dos SPIs: ADT arm-io "clock-frequencies"[302 - 256] = 60 MHz */
+@@ -142,4 +143,32 @@
+ 		apple,sensor-offsets = <0x20 0x60 0x220>;
+ 		apple,sensor-names = "CPU (TCC) 0", "CPU (TCC) 1", "CPU (TCC) 2";
+ 	};
++
++	/*
++	 * Armazenamento interno (fase 7): ANS = coprocessador da flash.
++	 * ADT arm-io/ans: reg 0x8040000 (0x1000 de CPU + 0x1000 de mailbox AKF),
++	 * IRQs 0x24..0x27 (o ADT lista 0x25 0x24 0x27 0x26), ps 0x16. A ordem foi
++	 * medida no aparelho: desmascarando no mailbox (reg 0x04) com uma mensagem
++	 * esperando, acende a 0x27 (recv-not-empty); com a fila de envio vazia, a 0x24.
++	 */
++	ans_mbox: mbox@208041000 {
++		compatible = "apple,t7000-akf-mailbox", "apple,s5l8960x-akf-mailbox";
++		reg = <0x2 0x08041000 0x0 0x1000>;
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_IRQ 36 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 39 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "send-empty", "send-not-empty",
++				  "recv-empty", "recv-not-empty";
++		#mbox-cells = <0>;
++		power-domains = <&ps_ans>;
++	};
++
++	ans: storage@208040000 {
++		compatible = "apple,t7000-ans1", "apple,ans1";
++		reg = <0x2 0x08040000 0x0 0x1000>;
++		mboxes = <&ans_mbox>;
++		power-domains = <&ps_ans>;
++	};
+ };

@@ -133,6 +133,25 @@ github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido 
     abre o Desenho. Power apaga a tela, Volume muda o brilho. Parado: 0% de CPU, ~5 MB de RAM
   - L4: sobe sozinha no boot (`rootfs/init`); `touch /tmp/sem-inicio; killall inicio` volta ao texto ✅
 
+## Fase 7: Armazenamento interno (flash de 128 GB) ← em andamento
+No A8 a flash é do **ANS**, um coprocessador ARM com firmware próprio (carregado pelo iBoot
+na RAM). Não é NVMe: o driver NVMe da Apple é do A11 em diante. Protocolo descoberto pela
+HoolockLinux (m1n1 `src/ans1.c`, `proxyclient/m1n1/fw/ans1.py`).
+
+- [x] Prova de vida no m1n1 (`m1n1/patches/0005`): GPT do iOS lida da flash ✅
+- [x] Mailbox AKF no Linux (`kernel/patches/0011`): máscara de IRQ achada no reg 0x04 ✅
+- [x] RTKit v10 (`kernel/patches/0013`): endpoint de armazenamento aberto junto com o mapa ✅
+- [x] Driver `apple-ans1` (`kernel/patches/0012`): `/dev/ans0`, 128 GB, só leitura, ~195 MB/s ✅
+- [x] **Coerência de memória** (contornada): o ANS escreve na RAM por fora de um cache do
+      lado da memória (MCC); a CPU, até sem cache, lia a cópia velha. Medido: varrer 8 MB
+      antes de ler resolve 100% (identify completo, todos os tamanhos de leitura idênticos,
+      "NXSB" do APFS no bloco 6). O driver faz isso (parâmetro `varre`, padrão ligado):
+      191 MB/s pelo cache do Linux, mas 2 MB/s em pedidos de 4 KB diretos
+- [x] Partições: `gpt` na linha de comando → `ans0p1` (container APFS de 125 GB) ✅
+- [ ] Trocar a varredura por algo eficiente: entender o MCC (0x200000000, ADT `mcc,t7000`).
+      Provavelmente conserta também o DMA do USB
+- [ ] Escrita (com confirmação: apaga o iOS)
+
 ## Fase 6: Android
 O Android é um kernel Linux + um userspace próprio (init do Android, Binder, SurfaceFlinger, ART).
 Requisitos e o plano para o iPhone 6:

@@ -1,0 +1,216 @@
+soc: apple: mailbox: variante AKF (coprocessadores do A7/A8)
+
+Mailbox dos IOPs iop,s5l8960x: registradores de 32 bits, mensagem única de 64
+bits (endpoint em 63:56). Liga os bits de habilitação das filas no start e
+desliga a IRQ de recebimento se ela disparar sem mensagens (linha errada no DT).
+
+Máscara de IRQ do mailbox (reg 0x00 mascara / 0x04 desmascara, um nibble por
+linha) e ordem das linhas medidas no iPhone 6 pelo HW_STATE do AIC.
+
+diff --git a/drivers/soc/apple/mailbox.c b/drivers/soc/apple/mailbox.c
+index 5c48455..97a8011 100644
+--- a/drivers/soc/apple/mailbox.c
++++ b/drivers/soc/apple/mailbox.c
+@@ -80,6 +80,41 @@
+ 
+ #define APPLE_MBOX_TX_TIMEOUT 500
+ 
++/*
++ * Mailbox "AKF" dos coprocessadores do A7/A8 (compatible iop,s5l8960x no ADT),
++ * em reg+0x1000 do IOP. Registradores de 32 bits, mas a mensagem é UMA palavra de
++ * 64 bits: endpoint em 63:56 e a mensagem RTKit em 55:0 (o tipo de gerenciamento,
++ * 59:52, sempre cabe em 55:52). Layout tirado do m1n1 (src/akf.c, src/rtkit.c).
++ */
++#define APPLE_AKF_MBOX_CONTROL_ENABLE BIT(0)
++/*
++ * Máscara das 4 IRQs do mailbox (um nibble cada; 1 = mascarada, começa 0x1111).
++ * Descoberto no iPhone 6 olhando o HW_STATE do AIC: escrever em 0x04 desmascara
++ * (escreve-1-limpa) e a leitura dá a máscara atual; 0x00 aparenta ser o "mascarar".
++ * Linhas no AIC na ordem natural: send-empty, send-not-empty, recv-empty,
++ * recv-not-empty (0x24..0x27 no A8).
++ */
++#define APPLE_AKF_MBOX_IRQ_MASK_SET 0x00
++#define APPLE_AKF_MBOX_IRQ_MASK_CLR 0x04
++#define APPLE_AKF_MBOX_IRQ_SEND_EMPTY BIT(0)
++#define APPLE_AKF_MBOX_IRQ_SEND_NOT_EMPTY BIT(4)
++#define APPLE_AKF_MBOX_IRQ_RECV_EMPTY BIT(8)
++#define APPLE_AKF_MBOX_IRQ_RECV_NOT_EMPTY BIT(12)
++#define APPLE_AKF_MBOX_A2I_CONTROL 0x08
++#define APPLE_AKF_MBOX_A2I_SEND0 0x10
++#define APPLE_AKF_MBOX_I2A_CONTROL 0x20
++#define APPLE_AKF_MBOX_I2A_RECV0 0x38
++#define APPLE_AKF_MBOX_MSG_EP GENMASK_ULL(63, 56)
++#define APPLE_AKF_MBOX_MSG_MSG GENMASK_ULL(55, 0)
++/* para testar a ordem das linhas sem trocar o DT: índice em "interrupts" (-1 = pelo nome) */
++static int akf_recv = -1, akf_send = -1;
++module_param(akf_recv, int, 0444);
++MODULE_PARM_DESC(akf_recv, "AKF: índice da IRQ recv-not-empty (-1 = interrupt-names)");
++module_param(akf_send, int, 0444);
++MODULE_PARM_DESC(akf_send, "AKF: índice da IRQ send-empty (-1 = interrupt-names)");
++/* se a IRQ de recebimento dispara isso tudo sem mensagem, ela está na linha errada */
++#define APPLE_AKF_MBOX_MAX_SPURIOUS 100000
++
+ struct apple_mbox_hw {
+ 	unsigned int control_full;
+ 	unsigned int control_empty;
+@@ -92,6 +127,9 @@ struct apple_mbox_hw {
+ 	unsigned int i2a_recv0;
+ 	unsigned int i2a_recv1;
+ 
++	bool akf;
++	unsigned int control_enable;
++
+ 	bool has_irq_controls;
+ 	unsigned int irq_enable;
+ 	unsigned int irq_ack;
+@@ -153,9 +191,16 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
+ 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
+ 	}
+ 
+-	writeq_relaxed(msg.msg0, mbox->regs + mbox->hw->a2i_send0);
+-	writeq_relaxed(FIELD_PREP(APPLE_MBOX_MSG1_MSG, msg.msg1),
+-		       mbox->regs + mbox->hw->a2i_send1);
++	if (mbox->hw->akf) {
++		dev_dbg(mbox->dev, "AP->IOP ep %u: %016llx\n", msg.msg1, msg.msg0);
++		writeq_relaxed(FIELD_PREP(APPLE_AKF_MBOX_MSG_EP, msg.msg1) |
++				       (msg.msg0 & APPLE_AKF_MBOX_MSG_MSG),
++			       mbox->regs + mbox->hw->a2i_send0);
++	} else {
++		writeq_relaxed(msg.msg0, mbox->regs + mbox->hw->a2i_send0);
++		writeq_relaxed(FIELD_PREP(APPLE_MBOX_MSG1_MSG, msg.msg1),
++			       mbox->regs + mbox->hw->a2i_send1);
++	}
+ 
+ 	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+ 
+@@ -190,10 +235,18 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
+ 	u32 mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+ 
+ 	while (!(mbox_ctrl & mbox->hw->control_empty)) {
+-		msg.msg0 = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
+-		msg.msg1 = FIELD_GET(
+-			APPLE_MBOX_MSG1_MSG,
+-			readq_relaxed(mbox->regs + mbox->hw->i2a_recv1));
++		if (mbox->hw->akf) {
++			u64 v = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
++
++			msg.msg0 = v & APPLE_AKF_MBOX_MSG_MSG;
++			msg.msg1 = FIELD_GET(APPLE_AKF_MBOX_MSG_EP, v);
++			dev_dbg(mbox->dev, "IOP->AP ep %u: %016llx\n", msg.msg1, msg.msg0);
++		} else {
++			msg.msg0 = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
++			msg.msg1 = FIELD_GET(
++				APPLE_MBOX_MSG1_MSG,
++				readq_relaxed(mbox->regs + mbox->hw->i2a_recv1));
++		}
+ 
+ 		mbox->rx(mbox, msg, mbox->cookie);
+ 		ret++;
+@@ -221,7 +274,16 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
+ 	struct apple_mbox *mbox = data;
+ 
+ 	spin_lock(&mbox->rx_lock);
+-	apple_mbox_poll_locked(mbox);
++	if (apple_mbox_poll_locked(mbox) > 0) {
++		mbox->spurious = 0;
++	} else if (mbox->hw->akf &&
++		   ++mbox->spurious == APPLE_AKF_MBOX_MAX_SPURIOUS) {
++		/* linha sempre ativa sem mensagens: não é a "recv-not-empty" */
++		dev_err(mbox->dev,
++			"IRQ %d dispara sem mensagens: linha errada no DT? desligando\n",
++			irq);
++		disable_irq_nosync(irq);
++	}
+ 	spin_unlock(&mbox->rx_lock);
+ 
+ 	return IRQ_HANDLED;
+@@ -265,6 +327,29 @@ int apple_mbox_start(struct apple_mbox *mbox)
+ 			       mbox->regs + mbox->hw->irq_enable);
+ 	}
+ 
++	/* AKF: as filas só funcionam habilitadas (o domínio de energia acabou de ligar) */
++	if (mbox->hw->control_enable) {
++		u32 v;
++
++		v = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
++		writel_relaxed(v | mbox->hw->control_enable,
++			       mbox->regs + mbox->hw->a2i_control);
++		v = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
++		writel_relaxed(v | mbox->hw->control_enable,
++			       mbox->regs + mbox->hw->i2a_control);
++	}
++
++	if (mbox->hw->akf) {
++		/* só as duas linhas que usamos; o AIC ainda controla a send-empty */
++		writel_relaxed(APPLE_AKF_MBOX_IRQ_SEND_NOT_EMPTY |
++				       APPLE_AKF_MBOX_IRQ_RECV_EMPTY,
++			       mbox->regs + APPLE_AKF_MBOX_IRQ_MASK_SET);
++		writel_relaxed(APPLE_AKF_MBOX_IRQ_SEND_EMPTY |
++				       APPLE_AKF_MBOX_IRQ_RECV_NOT_EMPTY,
++			       mbox->regs + APPLE_AKF_MBOX_IRQ_MASK_CLR);
++	}
++
++	mbox->spurious = 0;
+ 	enable_irq(mbox->irq_recv_not_empty);
+ 	mbox->active = true;
+ 	return 0;
+@@ -351,12 +436,18 @@ static int apple_mbox_probe(struct platform_device *pdev)
+ 	if (IS_ERR(mbox->regs))
+ 		return PTR_ERR(mbox->regs);
+ 
+-	mbox->irq_recv_not_empty =
+-		platform_get_irq_byname(pdev, "recv-not-empty");
++	if (mbox->hw->akf && akf_recv >= 0)
++		mbox->irq_recv_not_empty = platform_get_irq(pdev, akf_recv);
++	else
++		mbox->irq_recv_not_empty =
++			platform_get_irq_byname(pdev, "recv-not-empty");
+ 	if (mbox->irq_recv_not_empty < 0)
+ 		return -ENODEV;
+ 
+-	mbox->irq_send_empty = platform_get_irq_byname(pdev, "send-empty");
++	if (mbox->hw->akf && akf_send >= 0)
++		mbox->irq_send_empty = platform_get_irq(pdev, akf_send);
++	else
++		mbox->irq_send_empty = platform_get_irq_byname(pdev, "send-empty");
+ 	if (mbox->irq_send_empty < 0)
+ 		return -ENODEV;
+ 
+@@ -441,7 +532,23 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
+ 	.irq_bit_send_empty = APPLE_M3_MBOX_IRQ_A2I_EMPTY,
+ };
+ 
++static const struct apple_mbox_hw apple_mbox_akf_hw = {
++	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
++	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
++
++	.a2i_control = APPLE_AKF_MBOX_A2I_CONTROL,
++	.a2i_send0 = APPLE_AKF_MBOX_A2I_SEND0,
++
++	.i2a_control = APPLE_AKF_MBOX_I2A_CONTROL,
++	.i2a_recv0 = APPLE_AKF_MBOX_I2A_RECV0,
++
++	.akf = true,
++	.control_enable = APPLE_AKF_MBOX_CONTROL_ENABLE,
++	.has_irq_controls = false,
++};
++
+ static const struct of_device_id apple_mbox_of_match[] = {
++	{ .compatible = "apple,s5l8960x-akf-mailbox", .data = &apple_mbox_akf_hw },
+ 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
+ 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
+ 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
+diff --git a/drivers/soc/apple/mailbox.h b/drivers/soc/apple/mailbox.h
+index f73a891..1705d6d 100644
+--- a/drivers/soc/apple/mailbox.h
++++ b/drivers/soc/apple/mailbox.h
+@@ -31,6 +31,9 @@ struct apple_mbox {
+ 
+ 	struct completion tx_empty;
+ 
++	/* AKF (A7/A8): IRQs seguidas sem mensagem; proteção contra linha errada */
++	unsigned int spurious;
++
+ 	/** Receive callback for incoming messages */
+ 	void (*rx)(struct apple_mbox *mbox, struct apple_mbox_msg msg, void *cookie);
+ 	void *cookie;

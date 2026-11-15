@@ -1,0 +1,69 @@
+soc: apple: rtkit: opção para ligar endpoints de aplicação junto com os de sistema
+
+O ANS1 do A7/A8 (RTKit v10) pede o buffer de crashlog e então espera o
+endpoint de armazenamento abrir antes de confirmar o IOP power state. O RTKit
+do Linux só deixa abrir endpoints de aplicação depois dessa confirmação: os dois
+ficam esperando. O m1n1 abre o endpoint no callback do mapa de endpoints; a
+opção early_app_endpoints faz o mesmo.
+
+Também: tempo de espera por resposta vira parâmetro (timeout_ms, padrão 5 s):
+o ANS1 demora mais de 1 s para confirmar que dormiu.
+
+diff --git a/drivers/soc/apple/rtkit.c b/drivers/soc/apple/rtkit.c
+index a6bce18..5fa4345 100644
+--- a/drivers/soc/apple/rtkit.c
++++ b/drivers/soc/apple/rtkit.c
+@@ -210,6 +210,17 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
+ 		}
+ 	}
+ 
++	if (rtk->ops->early_app_endpoints) {
++		for (ep = rtk->app_ep_start; ep < APPLE_RTKIT_MAX_ENDPOINTS; ep++) {
++			if (!test_bit(ep, rtk->endpoints))
++				continue;
++			dev_dbg(rtk->dev, "RTKit: Starting app endpoint 0x%02x early\n", ep);
++			reply = FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, ep) |
++				APPLE_RTKIT_MGMT_STARTEP_FLAG;
++			apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, reply);
++		}
++	}
++
+ 	rtk->boot_result = 0;
+ 	complete_all(&rtk->epmap_completion);
+ }
+@@ -730,12 +741,17 @@ free_rtk:
+ }
+ EXPORT_SYMBOL_GPL(apple_rtkit_init);
+ 
++/* o ANS1 do A8 leva mais de 1 s para confirmar que dormiu (fecha o estado da flash) */
++static unsigned int timeout_ms = 5000;
++module_param(timeout_ms, uint, 0644);
++MODULE_PARM_DESC(timeout_ms, "espera por cada resposta do coprocessador, em ms");
++
+ static int apple_rtkit_wait_for_completion(struct completion *c)
+ {
+ 	long t;
+ 
+ 	t = wait_for_completion_interruptible_timeout(c,
+-						      msecs_to_jiffies(1000));
++						      msecs_to_jiffies(timeout_ms));
+ 	if (t < 0)
+ 		return t;
+ 	else if (t == 0)
+diff --git a/include/linux/soc/apple/rtkit.h b/include/linux/soc/apple/rtkit.h
+index dde8abe..e78b0d1 100644
+--- a/include/linux/soc/apple/rtkit.h
++++ b/include/linux/soc/apple/rtkit.h
+@@ -56,6 +56,12 @@ struct apple_rtkit_shmem {
+  *                 context.
+  */
+ struct apple_rtkit_ops {
++	/*
++	 * Liga os endpoints de aplicação junto com os de sistema, ao receber o
++	 * mapa de endpoints (como o m1n1 faz). O ANS1 do A7/A8 (RTKit v10) só
++	 * confirma o IOP power state depois que o endpoint de armazenamento abre.
++	 */
++	bool early_app_endpoints;
+ 	void (*crashed)(void *cookie, const void *crashlog, size_t crashlog_size);
+ 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
+ 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
