@@ -123,7 +123,9 @@ github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido 
 - [x] T5: driver de kernel `drivers/input/touchscreen/apple_n1.c` (`kernel/patches/0010`): carrega o
       firmware no boot em 0,25 s; `evtest` mostra multitoque padrão (slots, tracking IDs) ✅
 - [x] T6: m1n1 copia `multi-touch-calibration` e `prox-calibration` do ADT para o Linux (`m1n1/patches/0004`)
-- [ ] Interface: desenhar no framebuffer, depois LVGL/Wayland com toque
+- [x] Primeiro app: `device/desenho` (C sem libc, 6 KB): pinta onde o dedo passa, paleta de cores,
+      Home limpa, Volume muda a espessura, Power sai (`/dev/fb0` + `/dev/input` + `ppoll`)
+- [ ] Interface de verdade: LVGL ou Wayland (weston) com toque
 
 ## Fase 6: Android
 O Android é um kernel Linux + um userspace próprio (init do Android, Binder, SurfaceFlinger, ART).

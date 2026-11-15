@@ -87,3 +87,22 @@ __attribute__((used)) static void inicio_c(long *pilha)
     sair(principal((int)pilha[0], (char **)(pilha + 1)));
 }
 __asm__(".global _start\n_start:\n  mov x0, sp\n  b inicio_c\n");
+
+/*
+ * O compilador pode transformar laços em chamadas a memset/memcpy mesmo com
+ * -ffreestanding; como não há libc, damos versões simples (fracas: quem quiser,
+ * define a sua).
+ */
+__attribute__((weak, used)) void *memset(void *d, int c, unsigned long n)
+{
+    volatile unsigned char *p = d;
+    while (n--) *p++ = (unsigned char)c;
+    return d;
+}
+__attribute__((weak, used)) void *memcpy(void *d, const void *s, unsigned long n)
+{
+    volatile unsigned char *p = d;
+    const unsigned char *q = s;
+    while (n--) *p++ = *q++;
+    return d;
+}
