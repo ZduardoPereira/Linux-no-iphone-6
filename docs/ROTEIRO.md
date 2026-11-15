@@ -68,8 +68,14 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [x] Engenharia reversa: `readBK` bits 27..16 = temperatura (hipótese: décimos de °C),
       bit 31 = válido; bloco TCC só aceita acesso de 32 bits; experimento de aquecimento
 - [x] Driver `drivers/hwmon/apple-t7000-temp.c` + device tree (`kernel/patches/0004`)
-- [ ] Boot: `sensors` mostra os 5 sensores
+- [x] Boot: `sensors` mostra os sensores (5 no sysfs; nome único por bloco corrigido p/ o próximo boot)
 - [ ] Confirmar a escala: iPhone frio (desligado ~15 min) deve ler perto da temperatura ambiente
+
+### 4.3 Chips do i2c1
+- [x] `0x58` = o mesmo DRV2604 respondendo num 2º endereço (registradores idênticos ao vivo)
+- [x] `0x75` = carregador SN2400: eventos, status, limite de entrada e ADC entendidos ([SN2400.md](SN2400.md))
+- [x] Achado: reconectar o cabo derruba o limite para 90 mA; `i2cset -y 1 0x75 0x09 0x24` volta a 450 mA
+- [ ] Driver `power_supply` para o SN2400 (reprograma o limite sozinho, mostra VBUS/corrente/bateria)
 
 ### Depois
 2. **Bateria/carregador**: ler nível de bateria

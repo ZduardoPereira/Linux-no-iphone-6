@@ -21,7 +21,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | `gpio` | pinos | ✅ `apple-gpio-pinctrl` |
 | `uart0` | serial de debug | ✅ `ttySAC0` (precisa de cabo especial) |
 | `i2c0` | barramento I2C 0 | ✅ |
-| `i2c1` | barramento I2C 1 | ✅ (patch 0003); também respondem 0x58 e 0x75 |
+| `i2c1` | barramento I2C 1 | ✅ (patch 0003); 0x75 = carregador; 0x58 = o próprio DRV2604 num 2º endereço |
 | `i2c2` | barramento I2C 2 | ❌ não ativado no device tree |
 | `spi1..3` | barramentos SPI | ❌ |
 | `dwi` | brilho da tela | ✅ `apple-dwi-bl` (0–2047) |
@@ -48,7 +48,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | i2c0 | `tristar,cbtl1610` | chave do conector Lightning | ❌ |
 | i2c0 | `display-pmu,chestnut` | energia da tela | ❌ |
 | i2c1 | `vibrator,drv2604` (TI) | motor de vibração | ✅ `drv260x` (patch 0003) + `vibrar` |
-| i2c1 | `charger,sn2400` (TI) | carregador da bateria | ❌ |
+| i2c1 | `charger,sn2400` (TI) | carregador da bateria | ⚠️ registradores e ADC entendidos ([SN2400.md](SN2400.md)); sem driver ainda |
 | i2c1 | `audio-control,cs35l19` (Cirrus) | amplificador do alto-falante | ~ (`cs35l33` é parecido) |
 | i2c2 | `als,ct819` | sensor de luz ambiente | ❌ |
 | spi1 | `audio-control,cs42l67` (Cirrus) | codec de áudio (fones/mics) | ❌ |
