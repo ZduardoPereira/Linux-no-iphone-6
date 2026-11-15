@@ -21,6 +21,14 @@ mkdir -p "$BUILD/ssh"
 install -d -m 700 "$WORK/root/.ssh"
 install -m 600 "$BUILD/ssh/id_ed25519.pub" "$WORK/root/.ssh/authorized_keys"
 
+log "Programas nossos para o iPhone (device/*) -> /usr/local/bin"
+mkdir -p "$BUILD/device" "$WORK/usr/local/bin"
+for d in "$ROOT"/device/*/; do
+  n="$(basename "$d")"
+  (cd "$d" && make -s OUT=../../build/device UAPI="$(dirname "$KSRC")/uapi/include")   # make não aceita espaços
+  install -m 755 "$BUILD/device/$n" "$WORK/usr/local/bin/$n"
+done
+
 log "Copiando arquivos do projeto (rootfs/ por cima do Alpine)"
 cp -a "$ROOT/rootfs/." "$WORK/"
 chmod +x "$WORK/init"

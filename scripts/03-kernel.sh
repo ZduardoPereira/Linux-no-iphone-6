@@ -41,4 +41,6 @@ log "Compilando kernel (a primeira vez demora; ~10-20 min)"
 cp "$K/arch/arm64/boot/Image.gz"              "$BUILD/Image.gz"
 cp "$K/arch/arm64/boot/dts/apple/$DTB_NAME"   "$BUILD/$DTB_NAME"
 cp "$K/.config"                               "$BUILD/kernel.config"
+# Cabeçalhos do kernel para programas do iPhone (device/*), sem espaços no caminho
+"${MK[@]}" -s headers_install INSTALL_HDR_PATH="$(dirname "$KSRC")/uapi" >/dev/null
 log "Pronto: build/Image.gz e build/$DTB_NAME. Próximo: ./scripts/04-initramfs.sh"

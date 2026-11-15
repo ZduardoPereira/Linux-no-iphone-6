@@ -1,0 +1,39 @@
+dts: t7000-n61: motor de vibração TI DRV2604 no i2c1 (fase 4)
+
+Dados do ADT da Apple (i2c1/vib-pwm): endereço 0x5a, enable no GPIO 76, motor LRA.
+Tensões (2140/3320 mV) segundo github.com/ITSMEFRTRUST/linux-on-iphone6 (patch 0002).
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 10b4ca8ba..196bf9cc0 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -7,8 +7,29 @@
+ /dts-v1/;
+ 
+ #include "t7000-6.dtsi"
++#include <dt-bindings/input/ti-drv260x.h>
+ 
+ / {
+ 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
+ 	model = "Apple iPhone 6";
+ };
++
++/*
++ * Motor de vibração: TI DRV2604 (Linux-no-iphone-6, fase 4).
++ * Do ADT da Apple (arm-io/i2c1/vib-pwm): reg = 0x5a, function-enable = GPIO 76.
++ * Motor linear (LRA). Tensões = as que o driver do iOS 12.5.5 programa
++ * (RATED_VOLTAGE 0x61, OD_CLAMP 0x97), segundo github.com/ITSMEFRTRUST/linux-on-iphone6.
++ */
++&i2c1 {
++	status = "okay";
++
++	haptics@5a {
++		compatible = "ti,drv2604";
++		reg = <0x5a>;
++		enable-gpios = <&pinctrl 76 GPIO_ACTIVE_HIGH>;
++		mode = <DRV260X_LRA_MODE>;
++		library-sel = <DRV260X_LIB_LRA>;
++		vib-rated-mv = <2140>;
++		vib-overdrive-mv = <3320>;
++	};
++};

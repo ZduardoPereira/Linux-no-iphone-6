@@ -32,7 +32,7 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [ ] Enviar o patch do `DTXFSTS` para o kernel oficial (linux-usb)
 - [ ] 2º núcleo da CPU (conferir com `nproc`)
 
-## Fase 2: Conhecer o hardware por dentro do Linux ← estamos aqui
+## Fase 2: Conhecer o hardware por dentro do Linux ✅
 - [x] Explorar `/sys`, `/proc/device-tree`, `dmesg`: o que o kernel achou
 - [x] Ler o log do m1n1 (`/dev/mtd0`) e o device tree original da Apple (`/dev/mtd1`)
 - [x] Leitor do ADT (`host/adt.py`) e mapa completo em [HARDWARE.md](HARDWARE.md)
@@ -43,7 +43,7 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 
 **Você aprende:** device tree, sysfs, drivers de plataforma, como o kernel descobre o hardware.
 
-## Fase 3: Userspace de verdade ← em andamento
+## Fase 3: Userspace de verdade ✅ (o básico)
 - [x] Internet no iPhone através do PC (NAT): `./scripts/08-internet.sh`
 - [x] `apk add` funcionando dentro do iPhone
 - [x] SSH (dropbear) pela rede USB: `./scripts/ssh.sh` (chave do projeto em `build/ssh/`)
@@ -54,20 +54,26 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 
 **Você aprende:** init, rede Linux, NAT, gerenciador de pacotes, SSH.
 
-## Fase 4: Primeiro driver
-Escolha **uma** peça e escreva/porte o driver. Ordem sugerida, do mais fácil ao mais difícil:
-1. **Motor de vibração** (Taptic, via I2C): bom primeiro driver
+## Fase 4: Primeiro driver ← em andamento
+### 4.1 Vibração (TI DRV2604) ✅
+- [x] Dados do ADT: `i2c1`, endereço `0x5a`, enable no GPIO 76 (`host/adt.py -n arm-io/i2c1/vib-pwm`)
+- [x] Patch de device tree `kernel/patches/0003` (ativa `i2c1`, descreve o chip) + `CONFIG_INPUT_DRV260X_HAPTICS`
+- [x] Programa de teste `device/vibrar` (C sem libc, syscalls diretas: openat/ioctl/write)
+- [x] Boot: `i2cdetect -y 1` mostra o chip em 0x5a (`UU`); calibração automática vibra no boot
+- [x] `vibrar 300` faz o iPhone vibrar ✅ (15/11/2026)
+
+### Depois
+1. **Sensores de temperatura** (`tempsensor0..4`): primeiro driver em C (hwmon)
 2. **Bateria/carregador**: ler nível de bateria
-3. **Touchscreen** (Apple Z2, SPI): o Asahi já tem `apple_z2` para Macs; adaptar ao A8
+3. **Touchscreen** (Apple Z2, SPI): o mais importante para o Android
 4. **Armazenamento interno**: acompanhar o trabalho em andamento da Hoolock
 
-**Você aprende:** kernel modules, I2C/SPI, interrupções, engenharia reversa, enviar patches.
+**Você aprende:** device tree, I2C, GPIO, force-feedback/input, syscalls, depois drivers em C.
 
 > Referência para estudo, **não verificada**: o projeto
 > [ITSMEFRTRUST/linux-on-iphone6](https://github.com/ITSMEFRTRUST/linux-on-iphone6) diz ter
-> touch, Wi-Fi, áudio e câmera no iPhone 6 com 138 patches. Ele se declara "AI-assisted" e
-> não foi revisado pela comunidade. Leia os patches para aprender, mas não rode os scripts
-> dele (com sudo) sem entender o que fazem.
+> touch, Wi-Fi, áudio e câmera no iPhone 6 com 138 patches. Usamos só as tensões do motor
+> de vibração (patch 0002 deles) como referência. Não rode os scripts deles sem entender.
 
 ## Fase 5: Interface gráfica
 - [ ] Desenhar direto no framebuffer (`/dev/fb0` ou DRM dumb buffer)
