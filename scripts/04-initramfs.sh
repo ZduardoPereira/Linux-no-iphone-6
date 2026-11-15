@@ -30,6 +30,14 @@ for d in "$ROOT"/device/*/; do
   install -m 755 "$BUILD/device/$n" "$WORK/usr/local/bin/$n"
 done
 
+log "Touch: protótipo (n1.py + adt.py) em /root e firmware em /lib/firmware/apple/"
+install -m 755 "$ROOT/device/n1.py" "$ROOT/host/adt.py" "$WORK/root/"
+if [ -s "$BUILD/firmware/apple-n61-touch.bin" ]; then      # é da Apple: fica só no build/
+  install -D -m 644 "$BUILD/firmware/apple-n61-touch.bin" "$WORK/lib/firmware/apple/n61-touch.bin"
+else
+  echo "aviso: sem firmware do touch (rode ./scripts/09-firmware-touch.sh)"
+fi
+
 log "Copiando arquivos do projeto (rootfs/ por cima do Alpine)"
 cp -a "$ROOT/rootfs/." "$WORK/"
 chmod +x "$WORK/init"

@@ -100,6 +100,158 @@ def liga():
     print("6. sondagem do bootloader:")
     sonda(fd)
 
+# ---------- protocolo do bootloader (HBPP) ----------
+# Palavras de 16 bits big-endian. sw32(v) = bytes v[15:8] v[7:0] v[31:24] v[23:16].
+import struct
+ACK_DATA, ACK_ESCRITA = 0x4bc1, 0x4ad1
+
+def sw32(v):
+    return bytes([(v >> 8) & 255, v & 255, (v >> 24) & 255, (v >> 16) & 255])
+
+def ck16(b):
+    return struct.pack(">H", sum(b) & 0xffff)
+
+def troca_pares(b):
+    b = bytes(b) + bytes(-len(b) % 4)                  # completa até múltiplo de 4
+    return bytes(x for i in range(0, len(b), 2) for x in (b[i + 1], b[i]))
+
+def atn_ack(fd):
+    rx = xfer(fd, [0x1a, 0xa1])
+    return rx[0] << 8 | rx[1]
+
+def pacote_data(endereco, dados):
+    dados = bytes(dados) + bytes(-len(dados) % 4)
+    cab = struct.pack(">H", len(dados) // 4) + sw32(endereco)
+    return b"\x18\xe1\x30\x01" + cab + ck16(cab) + troca_pares(dados) + sw32(sum(dados))
+
+def envia_data(fd, endereco, dados, nome):
+    for tentativa in range(5):
+        xfer(fd, pacote_data(endereco, dados))
+        a = atn_ack(fd)
+        print("  %-22s -> %#010x (%4d bytes): ack %04x %s" %
+              (nome, endereco, len(dados), a, "✅" if a == ACK_DATA else "❌"))
+        if a == ACK_DATA:
+            return True
+    return False
+
+def mem_escreve(fd, endereco, valor, mascara=0xffffffff):
+    corpo = sw32(endereco) + sw32(mascara) + sw32(valor)
+    xfer(fd, b"\x1e\x33" + corpo + ck16(corpo))
+    a = atn_ack(fd)
+    print("  escreve %#010x = %#x: ack %04x %s" % (endereco, valor, a, "✅" if a == ACK_ESCRITA else "❌"))
+    return a == ACK_ESCRITA
+
+def mem_le(fd, endereco):
+    corpo = sw32(endereco)
+    xfer(fd, b"\x1c\x73" + corpo + ck16(corpo))
+    rx = xfer(fd, bytes([0x1a, 0xa1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1]))
+    return (rx[2] << 8 | rx[3]) | (rx[4] << 8 | rx[5]) << 16
+
+def calibracao_do_adt():
+    """Calibração de fábrica deste aparelho: o iBoot a coloca no ADT (/dev/mtd1)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import adt
+    raiz, _ = adt.ler_no(open("/dev/mtd1", "rb").read(), 0)
+    no = raiz
+    for nome in ("arm-io", "spi2", "multi-touch"):
+        no = [f for f in no["filhos"] if f["props"]["name"].rstrip(b"\0") == nome.encode()][0]
+    return no["props"]["multi-touch-calibration"], no["props"]["prox-calibration"]
+
+def carrega_calibracao(fd):
+    mtcl, pxcl = calibracao_do_adt()
+    print("calibração do ADT: MtCl %d bytes, PxCl %d bytes" % (len(mtcl), len(pxcl)))
+    ok = envia_data(fd, 0x10009600, pxcl, "PxCl (proximidade)")
+    for off in range(0, len(mtcl), 0x3f0):              # em pedaços de até 0x3f0
+        ok = ok and envia_data(fd, 0x10009000 + off, mtcl[off:off + 0x3f0], "MtCl (toque) +%#x" % off)
+    return ok
+
+def carrega_tudo(fd, firmware):
+    if not carrega_calibracao(fd):
+        sys.exit("a calibração não foi aceita")
+    fw = open(firmware, "rb").read()
+    for tentativa in range(5):                          # já vem como pacote DATA pronto
+        xfer(fd, fw)
+        a = atn_ack(fd)
+        print("  firmware (%d bytes): ack %04x %s" % (len(fw), a, "✅" if a == ACK_DATA else "❌"))
+        if a == ACK_DATA:
+            break
+    else:
+        sys.exit("o firmware não foi aceito")
+    versao = mem_le(fd, 0x10008ffc)
+    print("  versão no chip: %#010x" % versao)
+    ok = (mem_escreve(fd, 0x10003060, 0x17d3) and mem_escreve(fd, 0x1000305c, 0x2) and
+          mem_escreve(fd, 0x10003058, 0x6) and
+          mem_escreve(fd, 0x10003000, 2 if versao == 0x434d11a0 else 3) and
+          mem_escreve(fd, 0x10003518, 1))
+    if not ok:
+        sys.exit("sequência de calibração falhou")
+    mem_le(fd, 0x10003800)
+    xfer(fd, [0x1f, 0x01]); time.sleep(0.065); atn_ack(fd)
+    print("  calibrar (1f 01) enviado")
+    corpo = sw32(0x10003400) + sw32(1)
+    xfer(fd, b"\x1d\x53" + corpo + ck16(corpo))
+    time.sleep(0.040)
+    print("  EXECUTE @0x10003400 enviado — o firmware deve estar rodando; IRQ = %s" % irq())
+
+# ---------- modo normal (depois do EXECUTE): ler os toques ----------
+def le16(b):
+    return b[0] | b[1] << 8
+
+def s16(b):
+    v = le16(b)
+    return v - 0x10000 if v & 0x8000 else v
+
+def le_frame(fd, ctr):
+    """Comando 0xEB: pergunta o tamanho e depois lê o relatório. None = nada válido."""
+    cmd = bytearray(16)
+    cmd[0], cmd[1] = 0xEB, ctr
+    cmd[14:16] = struct.pack("<H", sum(cmd[:14]) & 0xffff)
+    rx = xfer(fd, cmd)
+    if rx[0] & 0xf0 != 0xE0 or le16(rx[14:16]) != sum(rx[:14]) & 0xffff:
+        return None
+    n = le16(rx[1:3])
+    if n == 0:
+        return b""
+    tx = bytearray(n + 5)
+    tx[0], tx[1], tx[2] = 0xEB, ctr, 1
+    tx[-2:] = struct.pack("<H", sum(tx[:-2]) & 0xffff)
+    rx = xfer(fd, tx)
+    if rx[0] not in (0xEB, 0xEA) or sum(rx[0:5]) & 0xff:
+        return None
+    L = le16(rx[2:4])
+    carga = rx[5:5 + L - 2]
+    if le16(rx[5 + L - 2:5 + L]) != sum(carga) & 0xffff:
+        return None
+    return carga
+
+ESTAGIOS = {1: "perto", 2: "pairando", 3: "encostou", 4: "tocando", 5: "soltou", 6: "saindo", 7: "fora"}
+
+def toques(fd, segundos=30):
+    print("Toque na tela! (%d s; coordenadas em pixels 750x1334)" % segundos)
+    ctr, fim, vistos = 1, time.time() + segundos, set()
+    while time.time() < fim:
+        if irq() != "0":                       # IRQ ativo em nível baixo
+            time.sleep(0.005)
+            continue
+        p = le_frame(fd, ctr)
+        if p is None:
+            continue
+        ctr = 3 - ctr                          # alterna 1 <-> 2 após frame bom
+        if not p:
+            continue
+        if p[0] != 0x44:
+            if p[0] not in vistos:
+                print("  relatório %#04x (%d bytes): %s" % (p[0], len(p), p[:24].hex(" ")))
+                vistos.add(p[0])
+            continue
+        n, tam, ini = p[16], p[17], p[2] + le16(p[14:16])
+        for i in range(n):
+            r = p[ini + i * tam: ini + (i + 1) * tam]
+            x, y = s16(r[4:6]), s16(r[6:8])
+            print("  dedo %d %-9s x=%4d y=%4d  (bruto %5d,%5d) pressão=%d" %
+                  (r[0], ESTAGIOS.get(r[1], r[1]), x * 750 // 5850, (10405 - y) * 1334 // 10405,
+                   x, y, le16(r[26:28])))
+
 def desliga():
     subprocess.run(["pkill", "-f", "gpioset"])           # solta a linha; o pino volta
     sh("gpioset", "-c", "gpiochip0", "-z", "%d=0" % PINO_RESET)
@@ -116,6 +268,19 @@ if __name__ == "__main__":
         liga()
     elif cmd == "sonda":
         sonda(os.open(spidev(), os.O_RDWR))
+    elif cmd == "calibracao":                 # T4a: só a calibração (cabe em 4096 bytes)
+        carrega_calibracao(os.open(spidev(), os.O_RDWR))
+    elif cmd == "carrega":                    # T4b: calibração + firmware + EXECUTE
+        carrega_tudo(os.open(spidev(), os.O_RDWR),
+                     sys.argv[2] if len(sys.argv) > 2 else "/lib/firmware/apple/n61-touch.bin")
+    elif cmd == "toques":                     # T4c: lê e mostra os toques
+        toques(os.open(spidev(), os.O_RDWR), int(sys.argv[2]) if len(sys.argv) > 2 else 30)
+    elif cmd == "tudo":                       # liga + carrega + toques
+        liga()
+        fd = os.open(spidev(), os.O_RDWR)
+        carrega_tudo(fd, "/lib/firmware/apple/n61-touch.bin")
+        time.sleep(0.1)
+        toques(fd, int(sys.argv[2]) if len(sys.argv) > 2 else 30)
     elif cmd == "desliga":
         desliga()
     else:

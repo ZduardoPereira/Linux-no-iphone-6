@@ -37,6 +37,8 @@ DTB_NAME="t7000-n61.dtb"
 BOOTARGS="console=ttySAC0,115200 console=tty0 loglevel=7"
 # Teste: USB em PIO em vez de DMA (patch kernel/patches/0001). Remova para voltar ao DMA.
 BOOTARGS="$BOOTARGS dwc2.apple_pio=1"
+# Touch (fase 5): o firmware vai numa transferência SPI só (65 KB); o padrão do spidev é 4 KB
+BOOTARGS="$BOOTARGS spidev.bufsiz=131072"
 # Rede via USB: o iPhone fica com .1 e o PC com .2
 PHONE_IP="172.16.42.1"
 HOST_IP="172.16.42.2"
