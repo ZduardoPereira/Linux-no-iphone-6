@@ -28,25 +28,20 @@ dropbear -R -s -E 2>/tmp/dropbear.log && echo "SSH: ./scripts/ssh.sh (root@$(cat
     sleep 1
   done ) &
 
-# Monitor na tela: a cada 10 s, pacotes da rede USB e interrupções do controlador USB.
-# rx = recebidos do PC, tx = enviados ao PC. Ajuda a ver qual direção do USB falha.
-( sleep 40
-  # Retrato dos registradores do dwc2 (estado de cada endpoint), uma vez só
-  echo "[monitor] ===== dwc2 state ====="
-  cat /sys/kernel/debug/usb/*.usbdev/state 2>/dev/null | grep -vE "^\s*$" | head -40
-  echo "[monitor] ======================="
-) &
-( while true; do
-    sleep 10
-    n=/sys/class/net/usb0/statistics
-    irq="$(grep -m1 -i dwc2 /proc/interrupts | awk '{print $2}')"
-    echo "[monitor] usb0 rx=$(cat $n/rx_packets 2>/dev/null) tx=$(cat $n/tx_packets 2>/dev/null)" \
-         "err=$(cat $n/rx_errors 2>/dev/null)/$(cat $n/tx_errors 2>/dev/null) irq_usb=$irq" \
-         "udc=$(cat /sys/class/udc/*/state 2>/dev/null)"
+# Tela inicial (LVGL, device/inicio). Espera o touch (o driver carrega o firmware
+# em segundo plano) e a reinicia se cair. Para voltar ao texto na tela:
+#   touch /tmp/sem-inicio; killall inicio
+( for i in $(seq 20); do
+    grep -qs "touchscreen" /sys/class/input/event*/device/name && break
+    sleep 0.5
+  done
+  while [ ! -e /tmp/sem-inicio ]; do
+    /usr/local/bin/inicio >/tmp/inicio.log 2>&1
+    sleep 2
   done ) &
 
 echo "Pronto. No PC: ./scripts/07-conectar.sh"
 echo "IP do iPhone: $(cat /etc/iphone6/phone_ip)"
 
-# Mantém o PID 1 vivo e com um shell na tela (sem touch, a tela é só leitura)
+# Mantém o PID 1 vivo; o shell no console aparece quando a tela inicial não está rodando
 while true; do /bin/sh -l; done

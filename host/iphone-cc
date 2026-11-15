@@ -1,0 +1,15 @@
+#!/bin/sh
+# Compilador C cruzado para o iPhone 6: clang do PC + sysroot do Alpine ARM64 (musl).
+# Gera binários estáticos (rodam no initramfs sem depender de nada).
+#   host/iphone-cc programa.c -o programa
+# O sysroot é criado por scripts/10-toolchain.sh.
+SR="${IPHONE_SYSROOT:-$HOME/.cache/linux-no-iphone-6/sysroot}"
+RT="$(ls "$SR"/usr/lib/llvm*/lib/clang/*/lib/aarch64-alpine-linux-musl/libclang_rt.builtins-aarch64.a 2>/dev/null | head -n1)"
+# só os cabeçalhos do musl e os internos do clang (sem os da glibc do Ubuntu)
+INC="-nostdinc -isystem $(clang -print-resource-dir)/include -isystem $SR/usr/include"
+case " $* " in
+  *" -c "*|*" -E "*|*" -S "*|*" -M "*|*" -MM "*) exec clang --target=aarch64-linux-musl $INC "$@" ;;
+esac
+exec clang --target=aarch64-linux-musl $INC -fuse-ld=lld -static \
+     -nostdlib "$SR/usr/lib/crt1.o" "$SR/usr/lib/crti.o" "$@" \
+     -L"$SR/usr/lib" -lc "$RT" "$SR/usr/lib/crtn.o"
