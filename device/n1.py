@@ -226,9 +226,10 @@ def le_frame(fd, ctr):
 
 ESTAGIOS = {1: "perto", 2: "pairando", 3: "encostou", 4: "tocando", 5: "soltou", 6: "saindo", 7: "fora"}
 
-def toques(fd, segundos=30):
+def toques(fd, segundos=30, resumo=False):
     print("Toque na tela! (%d s; coordenadas em pixels 750x1334)" % segundos)
     ctr, fim, vistos = 1, time.time() + segundos, set()
+    ndedos = 0
     while time.time() < fim:
         if irq() != "0":                       # IRQ ativo em nível baixo
             time.sleep(0.005)
@@ -245,9 +246,15 @@ def toques(fd, segundos=30):
                 vistos.add(p[0])
             continue
         n, tam, ini = p[16], p[17], p[2] + le16(p[14:16])
+        tocando = sum(1 for i in range(n) if p[ini + i * tam + 1] in (3, 4))
+        if resumo and tocando != ndedos:
+            print("  -> %d dedo(s) na tela" % tocando)
+        ndedos = tocando
         for i in range(n):
             r = p[ini + i * tam: ini + (i + 1) * tam]
             x, y = s16(r[4:6]), s16(r[6:8])
+            if resumo and r[1] not in (3, 5):         # só "encostou" e "soltou"
+                continue
             print("  dedo %d %-9s x=%4d y=%4d  (bruto %5d,%5d) pressão=%d" %
                   (r[0], ESTAGIOS.get(r[1], r[1]), x * 750 // 5850, (10405 - y) * 1334 // 10405,
                    x, y, le16(r[26:28])))
@@ -275,6 +282,8 @@ if __name__ == "__main__":
                      sys.argv[2] if len(sys.argv) > 2 else "/lib/firmware/apple/n61-touch.bin")
     elif cmd == "toques":                     # T4c: lê e mostra os toques
         toques(os.open(spidev(), os.O_RDWR), int(sys.argv[2]) if len(sys.argv) > 2 else 30)
+    elif cmd == "resumo":                     # só encostou/soltou + nº de dedos
+        toques(os.open(spidev(), os.O_RDWR), int(sys.argv[2]) if len(sys.argv) > 2 else 30, True)
     elif cmd == "tudo":                       # liga + carrega + toques
         liga()
         fd = os.open(spidev(), os.O_RDWR)

@@ -1,0 +1,31 @@
+m1n1: kboot: passa a calibração do touch do iPhone 6 (N61) para o Linux
+
+Copia multi-touch-calibration (apple,z2-cal-blob) e prox-calibration
+(apple,z2-prox-cal-blob) de /arm-io/spi2/multi-touch do ADT para o nó com alias
+touchbar0 no device tree do Linux, como já é feito para a Touch Bar dos Macs.
+
+diff --git a/src/kboot.c b/src/kboot.c
+index 2840651..07b5ca9 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -880,6 +880,8 @@ static int dt_set_multitouch(void)
+         adt_touchbar = "/arm-io/spi0/multi-touch";
+     else if (fdt_node_check_compatible(dt, 0, "apple,j493") == 0)
+         adt_touchbar = "/arm-io/spi3/touch-bar";
++    else if (fdt_node_check_compatible(dt, 0, "apple,n61") == 0)
++        adt_touchbar = "/arm-io/spi2/multi-touch";     /* iPhone 6 (Linux-no-iphone-6) */
+     else
+         return 0;
+ 
+@@ -895,6 +897,11 @@ static int dt_set_multitouch(void)
+     }
+ 
+     fdt_setprop(dt, node, "apple,z2-cal-blob", cal_blob, len);
++
++    /* iPhone: há também a calibração de proximidade (PxCl), enviada a 0x10009600 */
++    const u8 *prox = adt_getprop(adt, anode, "prox-calibration", &len);
++    if (prox && len)
++        fdt_setprop(dt, node, "apple,z2-prox-cal-blob", prox, len);
+     return 0;
+ }
+ 

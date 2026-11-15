@@ -52,7 +52,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | i2c1 | `audio-control,cs35l19` (Cirrus) | amplificador do alto-falante | ~ (`cs35l33` é parecido) |
 | i2c2 | `als,ct819` | sensor de luz ambiente | ❌ |
 | spi1 | `audio-control,cs42l67` (Cirrus) | codec de áudio (fones/mics) | ❌ |
-| spi2 | `multi-touch,n61` | **touchscreen** (Apple N1/Z2) | ⚠️ funciona pelo protótipo `device/n1.py` (SPI patch 0009 + firmware do iOS); driver de kernel a fazer |
+| spi2 | `multi-touch,n61` | **touchscreen** (Apple N1/Z2) | ✅ driver nosso `apple-n1` (patches 0009/0010, m1n1 0004) + firmware do iOS; multitoque |
 | spi3 | `biosensor,mesa` | Touch ID | ❌ (não faz sentido) |
 | uart1 | `bluetooth,n88` (BCM4345) | Bluetooth | ✅ `hci_bcm` existe, depende de energia/GPIO + firmware |
 | uart4 + apcie | `wlan-pcie-uart,bcm5345` (BCM4345) | Wi-Fi | ✅ `brcmfmac` existe, depende do PCIe |

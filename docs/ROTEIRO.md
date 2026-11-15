@@ -108,7 +108,7 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 > touch, Wi-Fi, áudio e câmera no iPhone 6 com 138 patches. Usamos só as tensões do motor
 > de vibração (patch 0002 deles) como referência. Não rode os scripts deles sem entender.
 
-## Fase 5: Touchscreen e interface gráfica ← em andamento (touch lido pelo protótipo ✅ 15/11/2026)
+## Fase 5: Touchscreen e interface gráfica ← em andamento (touch no kernel ✅ 15/11/2026)
 O chip de toque é o "N1" (família Apple Z2), no SPI2. Mapa do protocolo: re/MULTITOUCH.md de
 github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido aqui no aparelho.
 
@@ -119,9 +119,10 @@ github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido 
 - [x] T4a: calibração do ADT (`/dev/mtd1`) aceita pelo chip: PxCl + MtCl, ack `4bc1` ✅
 - [x] T4b: firmware (ack `4bc1`) + sequência de calibração (5× ack `4ad1`) + EXECUTE; versão no chip `0x434d15c1` ✅
 - [x] T4c: **toques lidos!** relatório `0x44`, trajetória lisa do dedo em pixels 750×1334 ✅ (`python3 /root/n1.py tudo 30`)
-- [ ] Conferir orientação dos eixos e multitoque
-- [ ] T5: driver de kernel (adaptar o `apple_z2`)
-- [ ] T6: m1n1 passa a calibração para o Linux
+- [x] Orientação conferida nos 4 cantos; multitoque (2 dedos) ✅; X um pouco negativo na borda esquerda
+- [x] T5: driver de kernel `drivers/input/touchscreen/apple_n1.c` (`kernel/patches/0010`): carrega o
+      firmware no boot em 0,25 s; `evtest` mostra multitoque padrão (slots, tracking IDs) ✅
+- [x] T6: m1n1 copia `multi-touch-calibration` e `prox-calibration` do ADT para o Linux (`m1n1/patches/0004`)
 - [ ] Interface: desenhar no framebuffer, depois LVGL/Wayland com toque
 
 ## Fase 6: Android
