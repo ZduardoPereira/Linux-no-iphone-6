@@ -1,0 +1,50 @@
+dts: t7000-n61: UART5 (fio HDQ do medidor de bateria) + pino 57 na função UART (fase 4.4)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 8c3f404..27bab01 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -12,6 +12,22 @@
+ / {
+ 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
+ 	model = "Apple iPhone 6";
++
++	aliases {
++		serial5 = &serial5;	/* vira /dev/ttySAC5 */
++	};
++};
++
++/*
++ * UART5 = fio HDQ do medidor de bateria TI bq27540 (fase 4.4).
++ * ADT: arm-io/uart5 (reg 0xa0d4000, IRQ 0xa3), filho "gas-gauge" (compatible
++ * gas-gauge,hdq). O TX é o pino 57 (function-tx / function-battery_swi), que
++ * precisa estar na função 1 (UART). O fio é compartilhado: o RX recebe o eco.
++ */
++&pinctrl {
++	uart5_pins: uart5-pins {
++		pinmux = <APPLE_PINMUX(57, 1)>;
++	};
+ };
+ 
+ /*
+@@ -51,6 +67,20 @@
+  * Driver: drivers/hwmon/apple-t7000-temp.c
+  */
+ &{/soc} {
++	serial5: serial@20a0d4000 {
++		compatible = "apple,s5l-uart";
++		reg = <0x2 0x0a0d4000 0x0 0x4000>;
++		reg-io-width = <4>;
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_IRQ 163 IRQ_TYPE_LEVEL_HIGH>;
++		/* mesmos clocks deixados pelo bootloader que as outras UARTs usam */
++		clocks = <&clkref>, <&clkref>;
++		clock-names = "uart", "clk_uart_baud0";
++		power-domains = <&ps_uart5>;
++		pinctrl-0 = <&uart5_pins>;
++		pinctrl-names = "default";
++	};
++
+ 	temperature-sensor@20e02b000 {
+ 		compatible = "apple,t7000-tempsensor";
+ 		reg = <0x2 0x0e02b000 0x0 0x1000>;

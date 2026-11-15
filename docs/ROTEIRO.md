@@ -78,6 +78,14 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [x] Driver `drivers/power/supply/sn2400_charger.c` (`kernel/patches/0005`): vigia a cada 2 s, reprograma o limite, fontes `sn2400-usb` e `sn2400-battery`
 - [x] Boot: fontes em `/sys/class/power_supply/`; tirar e pôr o cabo → driver reprogramou 450 mA sozinho ✅
 
+### 4.4 Percentual da bateria (TI bq27540 por HDQ) — em andamento
+- [x] ADT: medidor em `uart5` (0x20a0d4000, IRQ 163), fio HDQ = pino 57 (TX); acesso pedido ao SN2400 (`0x1d`)
+- [x] Protocolo (segundo ITSMEFRTRUST, a confirmar): 57600 8N2, `0xFE`=1 / `0xC0`=0, eco no RX, break = `0x00` a 9600
+- [x] Device tree: UART5 ativa + pino 57 na função UART (`kernel/patches/0006`) → `/dev/ttySAC5`
+- [x] Protótipo em Python (`device/hdq.py`): **95 %**, 4345 mV, 29 °C, 1732/1810 mAh, 2 ciclos ([BQ27540.md](BQ27540.md))
+- [ ] Corrente da bateria: `0x14` fica em 997 fixo (firmware da Apple?)
+- [ ] Driver nosso ligando a UART ao núcleo `bq27xxx` do kernel
+
 ### Depois
 2. **Bateria/carregador**: ler nível de bateria
 3. **Touchscreen** (Apple Z2, SPI): o mais importante para o Android

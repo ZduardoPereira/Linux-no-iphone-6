@@ -56,7 +56,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | spi3 | `biosensor,mesa` | Touch ID | ❌ (não faz sentido) |
 | uart1 | `bluetooth,n88` (BCM4345) | Bluetooth | ✅ `hci_bcm` existe, depende de energia/GPIO + firmware |
 | uart4 + apcie | `wlan-pcie-uart,bcm5345` (BCM4345) | Wi-Fi | ✅ `brcmfmac` existe, depende do PCIe |
-| uart5 | `gas-gauge,bq27540` (TI) | medidor de bateria (HDQ) | ~ `bq27xxx` existe, precisa do transporte HDQ |
+| uart5 | `gas-gauge,bq27540` (TI) | medidor de bateria (HDQ) | ⚠️ lido por protótipo em Python ([BQ27540.md](BQ27540.md)); driver de kernel a fazer |
 | uart8 | `apple-oscar` | coprocessador de movimento (M8) | ❌ |
 | mipi-dsim | `lcd,pinot` | painel da tela | ❌ |
 
