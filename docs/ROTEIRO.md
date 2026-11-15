@@ -71,11 +71,12 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [x] Boot: `sensors` mostra os sensores (5 no sysfs; nome único por bloco corrigido p/ o próximo boot)
 - [ ] Confirmar a escala: iPhone frio (desligado ~15 min) deve ler perto da temperatura ambiente
 
-### 4.3 Chips do i2c1
+### 4.3 Chips do i2c1 ✅
 - [x] `0x58` = o mesmo DRV2604 respondendo num 2º endereço (registradores idênticos ao vivo)
 - [x] `0x75` = carregador SN2400: eventos, status, limite de entrada e ADC entendidos ([SN2400.md](SN2400.md))
 - [x] Achado: reconectar o cabo derruba o limite para 90 mA; `i2cset -y 1 0x75 0x09 0x24` volta a 450 mA
-- [ ] Driver `power_supply` para o SN2400 (reprograma o limite sozinho, mostra VBUS/corrente/bateria)
+- [x] Driver `drivers/power/supply/sn2400_charger.c` (`kernel/patches/0005`): vigia a cada 2 s, reprograma o limite, fontes `sn2400-usb` e `sn2400-battery`
+- [x] Boot: fontes em `/sys/class/power_supply/`; tirar e pôr o cabo → driver reprogramou 450 mA sozinho ✅
 
 ### Depois
 2. **Bateria/carregador**: ler nível de bateria
