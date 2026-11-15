@@ -1,0 +1,44 @@
+m1n1: smp: núcleo secundário desce de EL3 no mesmo modo de segurança da CPU de boot
+
+No iPhone 6 via pongoOS antigo, a CPU 0 roda o m1n1 em EL1 SEGURO e a CPU 1 acorda
+em EL3. O m1n1 descia a CPU 1 como NÃO-segura (SCR_EL3.NS=1): os caches tratam os
+acessos das duas como endereços diferentes, a CPU 1 leu target_cpu=0 (valor velho da
+RAM) e marcou o flag na entrada errada da spin_table -> 'Starting CPU 1... Failed!'.
+Provado com as pegadas do patch 0002. Agora: secundário mantém NS=0.
+
+diff --git a/src/start.S b/src/start.S
+index 7a97583..9ddbcda 100644
+--- a/src/start.S
++++ b/src/start.S
+@@ -115,6 +115,7 @@ start_el3:
+     msr tpidr_el3, xzr
+     adrp x6, _stack_bot
+     adr x7, _start_c
++    mov x13, xzr        // CPU de boot: desce para EL1 não-seguro (comportamento original)
+     b el3_eret_to_el1
+ 
+ .globl exc_unk
+@@ -184,6 +185,13 @@ cpu_reset:
+ 
+ cpu_reset_el3:
+     bl _cpu_reset_c
++    /*
++     * Linux-no-iphone-6: núcleo secundário. Fica no MESMO modo de segurança da CPU de
++     * boot. No iPhone 6 via pongoOS antigo a CPU 0 já está em EL1 seguro; se a CPU 1
++     * descer como não-segura, os caches tratam os acessos das duas como endereços
++     * diferentes e a CPU 1 não enxerga o que a CPU 0 escreveu (ex.: target_cpu).
++     */
++    mov x13, #1
+     adrp x6, _reset_stack_el1
+     add x6, x6, :lo12:_reset_stack_el1
+     ldr x6, [x6]
+@@ -196,7 +204,9 @@ el3_eret_to_el1:
+ 
+     mrs x8, scr_el3
+     orr x8, x8, #(1<<10) // EL1 execution state is AArch64
++    cbnz x13, 2f         // secundário: mantém NS = 0 (ver cpu_reset_el3)
+     orr x8, x8, #(1<<0)  // EL1 is non-secure
++2:
+     msr scr_el3, x8
+     /* Linux-no-iphone-6: pegada 0x22 + o SCR_EL3 que vamos usar para descer a EL1 */
+     ldr x10, =0x83e8fff00

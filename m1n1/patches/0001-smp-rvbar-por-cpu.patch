@@ -1,0 +1,66 @@
+m1n1: smp: fallback do RVBAR usa regs[index] e escrita preserva os bits altos
+
+1) smp_get_iorvbar, no último caminho (sem cpu-impl-reg nem reg-private), devolvia
+   sempre regs[0] do /arm-io e comparava bytes com índice. Bug real, mas NÃO é o que
+   acontece no iPhone 6: lá o caminho usado é o reg-private (0x202110000 + 0x40000).
+2) A escrita do RVBAR passa a trocar só o endereço, preservando os outros bits
+   (no A8 os bits 63..48 valem 0x102).
+O 2º núcleo do iPhone 6 é resolvido no stub (boot/pongo-stub, trampolim no endereço
+que o recfg do iBoot restaura no RVBAR), não aqui.
+
+diff --git a/src/smp.c b/src/smp.c
+index 83eadff..8c89751 100644
+--- a/src/smp.c
++++ b/src/smp.c
+@@ -111,6 +111,13 @@ void smp_secondary_prep_el3(void)
+     return;
+ }
+ 
++/* Troca só o endereço do RVBAR; preserva os outros bits (no A8 os bits 63..48 = 0x102) */
++static void rvbar_set_entry(u64 iorvbar)
++{
++    u64 v = read64(iorvbar) & ~(RVBAR_ADDR | RVBAR_LOCK);
++    write64(iorvbar, v | (u64)_vectors_start);
++}
++
+ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u64 cpu_start_base)
+ {
+     int i;
+@@ -151,7 +158,7 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
+ 
+     if (cpu_features->apple_sysregs_unlocked) {
+         // This also clears RVBAR_LOCK, so that HV can set RVBAR later when the core is running
+-        write64(impl, (u64)_vectors_start);
++        rvbar_set_entry(impl);
+     }
+ 
+     cpu_start_base += die * PMGR_DIE_OFFSET;
+@@ -247,11 +254,17 @@ static u64 smp_get_iorvbar(int node, int cpu)
+     const u64 *regs = adt_getprop(adt, arm_io_node, "reg", &reg_len);
+     if (!regs)
+         return 0;
++    /*
++     * /arm-io "reg" = [base, len] por bloco; o bloco da CPU n (o "impl", cujo 1o
++     * registrador é o RVBAR) está na entrada 2n+2. Antes devolvia sempre regs[0]
++     * (e comparava bytes com índice): no iPhone 6 o RVBAR da CPU 1 nunca era
++     * escrito e ela acordava no endereço que o iBoot deixou (Linux-no-iphone-6).
++     */
+     u32 index = 2 * cpu + 2;
+-    if (reg_len < index)
++    if (reg_len / sizeof(u64) <= index)
+         return 0;
+ 
+-    return regs[0];
++    return regs[index];
+ }
+ 
+ void smp_start_secondaries(void)
+@@ -395,7 +408,7 @@ void smp_start_secondaries(void)
+                 continue;
+ 
+             // Unlocked, write _vectors_start into boot CPU's rvbar
+-            write64(iorvbar, (u64)_vectors_start);
++            rvbar_set_entry(iorvbar);
+             sysop("dmb sy");
+ 
+             continue;

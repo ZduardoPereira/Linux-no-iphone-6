@@ -30,7 +30,13 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 ### Pendências da fase 1
 - [ ] Descobrir por que o DMA do USB falha (pongoOS antigo deixa algo configurado?)
 - [ ] Enviar o patch do `DTXFSTS` para o kernel oficial (linux-usb)
-- [ ] 2º núcleo da CPU (conferir com `nproc`)
+- [x] **2º núcleo funcionando** (`nproc` = 2, 2 núcleos a 100% sem erros). A causa, achada
+      com "pegadas" que a CPU 1 deixa na RAM (`m1n1/patches/0002`): a CPU 0 roda em EL1
+      **seguro** (como o iBoot/pongoOS antigo deixam) e o m1n1 descia a CPU 1 de EL3 como
+      **não-segura**; os caches tratam os dois modos como endereços diferentes, a CPU 1 leu
+      `target_cpu` velho e marcou o flag na entrada errada da `spin_table`. Correção:
+      `m1n1/patches/0003` (secundário mantém NS=0). Hipóteses descartadas no caminho:
+      RVBAR travado, "recfg" restaurando o RVBAR (o trampolim do stub fica, inofensivo)
 
 ## Fase 2: Conhecer o hardware por dentro do Linux ✅
 - [x] Explorar `/sys`, `/proc/device-tree`, `dmesg`: o que o kernel achou
@@ -39,7 +45,8 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [x] Brilho (`/sys/class/backlight`, 0–2047) e cpufreq (300 MHz–1,39 GHz, `schedutil`)
 - [ ] Testar os botões lendo `/dev/input/event0`
 - [ ] Ler `t7000.dtsi` no kernel e comparar nó a nó com o ADT (`build/adt.txt`)
-- [ ] Investigar o 2º núcleo (IORVBAR) e o DMA do USB
+- [x] Investigar o 2º núcleo ✅
+- [ ] Investigar o DMA do USB
 
 **Você aprende:** device tree, sysfs, drivers de plataforma, como o kernel descobre o hardware.
 
@@ -78,14 +85,16 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 - [x] Driver `drivers/power/supply/sn2400_charger.c` (`kernel/patches/0005`): vigia a cada 2 s, reprograma o limite, fontes `sn2400-usb` e `sn2400-battery`
 - [x] Boot: fontes em `/sys/class/power_supply/`; tirar e pôr o cabo → driver reprogramou 450 mA sozinho ✅
 
-### 4.4 Percentual da bateria (TI bq27540 por HDQ) — em andamento
+### 4.4 Percentual da bateria (TI bq27540 por HDQ) ✅
 - [x] ADT: medidor em `uart5` (0x20a0d4000, IRQ 163), fio HDQ = pino 57 (TX); acesso pedido ao SN2400 (`0x1d`)
 - [x] Protocolo (segundo ITSMEFRTRUST, a confirmar): 57600 8N2, `0xFE`=1 / `0xC0`=0, eco no RX, break = `0x00` a 9600
 - [x] Device tree: UART5 ativa + pino 57 na função UART (`kernel/patches/0006`) → `/dev/ttySAC5`
 - [x] Protótipo em Python (`device/hdq.py`): **95 %**, 4345 mV, 29 °C, 1732/1810 mAh, 2 ciclos ([BQ27540.md](BQ27540.md))
 - [ ] Corrente da bateria: `0x14` fica em 997 fixo (firmware da Apple?)
 - [x] Driver `drivers/power/supply/apple_hdq_battery.c` (`kernel/patches/0007`): UART5 em polling 8N2 + núcleo `bq27xxx`
-- [ ] Boot: `/sys/class/power_supply/bq27540-battery/capacity` mostra o percentual
+- [x] Boot: `/sys/class/power_supply/bq27540-battery/` → **95 %**, 4,346 V, 29 °C, 1732/1810 mAh, 2 ciclos ✅
+- [x] Unificar numa bateria só (`kernel/patches/0008`): `bq27xxx` sem corrente usa o carregador (`power-supplies`) para o status
+- [ ] Boot: só `bq27540-battery`, status "Charging" com o cabo
 
 ### Depois
 2. **Bateria/carregador**: ler nível de bateria

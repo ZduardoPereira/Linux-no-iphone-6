@@ -13,7 +13,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | Bloco (ADT) | O que é | Linux hoje |
 |---|---|---|
 | CPU 0 (Typhoon) | núcleo ARMv8 | ✅ |
-| CPU 1 | 2º núcleo | 🔒 m1n1: "Starting CPU 1… Failed!" (IORVBAR travado pelo iBoot no boot via checkra1n) |
+| CPU 1 | 2º núcleo | ✅ com `m1n1/patches/0003` (CPU 1 no mesmo modo de segurança da CPU 0) |
 | `aic` | controlador de interrupções | ✅ |
 | `pmgr` | gerência de energia/clocks (95 domínios) | ✅ `apple-pmgr-pwrstate` |
 | `clpc` / performance-controller | frequência da CPU | ✅ cpufreq existe (nó `202220000` sem driver próprio) |
@@ -56,7 +56,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | spi3 | `biosensor,mesa` | Touch ID | ❌ (não faz sentido) |
 | uart1 | `bluetooth,n88` (BCM4345) | Bluetooth | ✅ `hci_bcm` existe, depende de energia/GPIO + firmware |
 | uart4 + apcie | `wlan-pcie-uart,bcm5345` (BCM4345) | Wi-Fi | ✅ `brcmfmac` existe, depende do PCIe |
-| uart5 | `gas-gauge,bq27540` (TI) | medidor de bateria (HDQ) | ⚠️ lido por protótipo em Python ([BQ27540.md](BQ27540.md)); driver de kernel a fazer |
+| uart5 | `gas-gauge,bq27540` (TI) | medidor de bateria (HDQ) | ✅ driver nosso `apple-hdq-battery` (patch 0007) + núcleo `bq27xxx`; corrente indisponível ([BQ27540.md](BQ27540.md)) |
 | uart8 | `apple-oscar` | coprocessador de movimento (M8) | ❌ |
 | mipi-dsim | `lcd,pinot` | painel da tela | ❌ |
 

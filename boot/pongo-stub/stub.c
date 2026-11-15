@@ -60,6 +60,34 @@ static void fix_firmware_version(struct boot_args *ba)
     }
 }
 
+/*
+ * 2º núcleo (CPU 1). Ao ligar um núcleo, o "recfg" do PMGR (sequência programada
+ * pelo iBoot) restaura o RVBAR dele para o endereço que o iBoot escolheu — o mesmo
+ * para os dois núcleos. O m1n1 até escreve o próprio endereço no RVBAR, mas o recfg
+ * desfaz. Então colocamos NESSE endereço um trampolim que pula para o m1n1, cujo
+ * vetor de reset (offset 0) já sabe receber um núcleo novo, inclusive em EL3.
+ * RVBAR da CPU 1 do A8: ADT cpus/cpu1 "reg-private" (0x202110000) + 0x40000.
+ */
+#ifndef STUB_RVBAR_CPU1
+#define STUB_RVBAR_CPU1 0x202150000UL
+#endif
+#define RVBAR_ENDERECO 0x0000fffffffff000UL
+
+static void trampolim_cpu1(u64 m1n1, u64 m1n1_fim, u64 stub, u64 stub_fim)
+{
+    u64 alvo = *(volatile u64 *)STUB_RVBAR_CPU1 & RVBAR_ENDERECO;
+
+    if (!alvo || alvo == m1n1)
+        return;                            /* já aponta para o m1n1 */
+    if ((alvo + 16 > stub && alvo < stub_fim) || (alvo + 16 > m1n1 && alvo < m1n1_fim))
+        return;                            /* cairia em cima de código em uso */
+
+    volatile unsigned int *p = (volatile unsigned int *)alvo;
+    p[0] = 0x58000050;                     /* ldr x16, [pc, #8] */
+    p[1] = 0xd61f0200;                     /* br  x16           */
+    *(volatile u64 *)(alvo + 8) = m1n1;    /* endereço do vetor de reset do m1n1 */
+}
+
 u64 stub_main(struct boot_args *ba, u8 *self)
 {
     u64 src = (u64)self + STUB_SIZE;
@@ -77,5 +105,7 @@ u64 stub_main(struct boot_args *ba, u8 *self)
             d[i] = s[i];
     }
     ba->top_of_kernel_data = ALIGN16K(dst + size);
+    /* depois da cópia: a origem já não é necessária */
+    trampolim_cpu1(dst, dst + size, (u64)self, (u64)self + STUB_SIZE);
     return dst + 0x800;
 }

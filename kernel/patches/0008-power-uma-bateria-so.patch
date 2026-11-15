@@ -1,0 +1,168 @@
+power: uma bateria só — bq27xxx sem corrente usa o carregador para o status; sn2400 sem fonte battery
+
+diff --git a/include/linux/power/bq27xxx_battery.h b/include/linux/power/bq27xxx_battery.h
+index d56e127..0716920 100644
+--- a/include/linux/power/bq27xxx_battery.h
++++ b/include/linux/power/bq27xxx_battery.h
+@@ -64,6 +64,12 @@ struct bq27xxx_device_info {
+ 	int voltage_min_design;
+ 	int voltage_max_design;
+ 	bool removed;
++	/*
++	 * The gauge firmware does not report a usable current (e.g. the iPhone 6
++	 * bq27540): current_now is unavailable and the status comes from the
++	 * supplying charger (power-supplies) instead of the sign of the current.
++	 */
++	bool no_current;
+ 	unsigned long last_update;
+ 	union power_supply_propval last_status;
+ 	struct delayed_work work;
+diff --git a/drivers/power/supply/bq27xxx_battery.c b/drivers/power/supply/bq27xxx_battery.c
+index 01c9ec1..8bd68eb 100644
+--- a/drivers/power/supply/bq27xxx_battery.c
++++ b/drivers/power/supply/bq27xxx_battery.c
+@@ -1867,6 +1867,22 @@ static int bq27xxx_battery_current_and_status(
+ 	int curr;
+ 	int flags;
+ 
++	if (di->no_current) {
++		if (val_curr)
++			return -ENODATA;
++		flags = cache ? cache->flags :
++			bq27xxx_read(di, BQ27XXX_REG_FLAGS, single_flags);
++		if (flags < 0)
++			return flags;
++		if (bq27xxx_battery_is_full(di, flags))
++			val_status->intval = POWER_SUPPLY_STATUS_FULL;
++		else if (power_supply_am_i_supplied(di->bat) > 0)
++			val_status->intval = POWER_SUPPLY_STATUS_CHARGING;
++		else
++			val_status->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		return 0;
++	}
++
+ 	curr = bq27xxx_read(di, BQ27XXX_REG_AI, false);
+ 	if (curr < 0) {
+ 		dev_err(di->dev, "error reading current\n");
+diff --git a/drivers/power/supply/apple_hdq_battery.c b/drivers/power/supply/apple_hdq_battery.c
+index 8f96fd1..f8ed588 100644
+--- a/drivers/power/supply/apple_hdq_battery.c
++++ b/drivers/power/supply/apple_hdq_battery.c
+@@ -252,6 +252,8 @@ static int apple_hdq_probe(struct platform_device *pdev)
+ 	h->di.chip = BQ27541;		/* mesmo mapa de registradores */
+ 	h->di.name = "bq27540-battery";
+ 	h->di.bus.read = apple_hdq_read;
++	/* sem corrente confiável: o status vem do carregador (power-supplies no DT) */
++	h->di.no_current = true;
+ 
+ 	ret = bq27xxx_battery_setup(&h->di);
+ 	if (ret) {
+diff --git a/drivers/power/supply/sn2400_charger.c b/drivers/power/supply/sn2400_charger.c
+index cfe5af1..bb9a4d7 100644
+--- a/drivers/power/supply/sn2400_charger.c
++++ b/drivers/power/supply/sn2400_charger.c
+@@ -7,6 +7,9 @@
+  * iOS 12.5.5 feita por github.com/ITSMEFRTRUST/linux-on-iphone6 (re/SN2400.md).
+  * Detalhes e o que foi conferido: docs/SN2400.md do projeto.
+  *
++ * A bateria (percentual, tensão) é do driver apple_hdq_battery, que declara este
++ * carregador como sua fonte (power-supplies) e usa o "online" daqui para o status.
++ *
+  *   0x04..0x06  eventos (zeram ao ler)
+  *   0x07        status; bit 0 = VBUS presente
+  *   0x09        limite de corrente de ENTRADA: mA = 90 + 10 * código (0..0xBF)
+@@ -54,7 +57,6 @@
+ struct sn2400 {
+ 	struct i2c_client *client;
+ 	struct power_supply *usb;
+-	struct power_supply *bat;
+ 	struct delayed_work poll;
+ 	struct mutex lock;		/* serializa o ADC e as escritas */
+ 	u32 ilim_ua;			/* limite de entrada desejado */
+@@ -149,8 +151,7 @@ static void sn2400_poll(struct work_struct *work)
+ 		c->online = online;
+ 		dev_info(&c->client->dev, "cabo %s\n",
+ 			 online ? "conectado" : "desconectado");
+-		power_supply_changed(c->usb);
+-		power_supply_changed(c->bat);
++		power_supply_changed(c->usb);	/* avisa a bateria (power-supplies) */
+ 	}
+ fim:
+ 	schedule_delayed_work(&c->poll, msecs_to_jiffies(SN2400_POLL_MS));
+@@ -230,53 +231,6 @@ static const struct power_supply_desc sn2400_usb_desc = {
+ 	.property_is_writeable = sn2400_usb_writeable,
+ };
+ 
+-/* ---- fonte "battery" (só o que o carregador sabe medir) ---- */
+-
+-static const enum power_supply_property sn2400_bat_props[] = {
+-	POWER_SUPPLY_PROP_STATUS,
+-	POWER_SUPPLY_PROP_PRESENT,
+-	POWER_SUPPLY_PROP_TECHNOLOGY,
+-	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+-};
+-
+-static int sn2400_bat_get(struct power_supply *psy,
+-			  enum power_supply_property psp,
+-			  union power_supply_propval *val)
+-{
+-	struct sn2400 *c = power_supply_get_drvdata(psy);
+-	int r;
+-
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_STATUS:
+-		/* aproximação: sem o medidor de bateria não dá para saber "cheia" */
+-		val->intval = c->online ? POWER_SUPPLY_STATUS_CHARGING :
+-					  POWER_SUPPLY_STATUS_DISCHARGING;
+-		return 0;
+-	case POWER_SUPPLY_PROP_PRESENT:
+-		val->intval = 1;
+-		return 0;
+-	case POWER_SUPPLY_PROP_TECHNOLOGY:
+-		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
+-		return 0;
+-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+-		r = sn2400_adc(c, SN2400_ADC_VBAT);
+-		if (r < 0)
+-			return r;
+-		val->intval = 2500000 + r * 10000;
+-		return 0;
+-	default:
+-		return -EINVAL;
+-	}
+-}
+-
+-static const struct power_supply_desc sn2400_bat_desc = {
+-	.name = "sn2400-battery",
+-	.type = POWER_SUPPLY_TYPE_BATTERY,
+-	.properties = sn2400_bat_props,
+-	.num_properties = ARRAY_SIZE(sn2400_bat_props),
+-	.get_property = sn2400_bat_get,
+-};
+-
+ static void sn2400_stop_poll(void *data)
+ {
+ 	struct sn2400 *c = data;
+@@ -312,10 +266,6 @@ static int sn2400_probe(struct i2c_client *client)
+ 	c->usb = devm_power_supply_register(dev, &sn2400_usb_desc, &cfg);
+ 	if (IS_ERR(c->usb))
+ 		return dev_err_probe(dev, PTR_ERR(c->usb), "fonte usb\n");
+-	cfg.fwnode = NULL;
+-	c->bat = devm_power_supply_register(dev, &sn2400_bat_desc, &cfg);
+-	if (IS_ERR(c->bat))
+-		return dev_err_probe(dev, PTR_ERR(c->bat), "fonte battery\n");
+ 
+ 	INIT_DELAYED_WORK(&c->poll, sn2400_poll);
+ 	ret = devm_add_action_or_reset(dev, sn2400_stop_poll, c);
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 0e02b68..10b1981 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -75,6 +75,7 @@
+ 		pinctrl-0 = <&uart5_pins>;
+ 		pinctrl-names = "default";
+ 		apple,hdq-master = <&charger>;	/* quem entrega o fio (SN2400, 0x1d) */
++		power-supplies = <&charger>;	/* quem carrega: dá o status "carregando" */
+ 	};
+ 
+ 	temperature-sensor@20e02b000 {

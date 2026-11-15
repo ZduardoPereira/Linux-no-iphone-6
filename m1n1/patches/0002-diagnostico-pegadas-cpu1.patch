@@ -1,0 +1,116 @@
+m1n1: DIAGNÓSTICO do 2º núcleo — pegadas em 0x83e8fff00 (fim da região do log)
+
++0x00 0x11|CurrentEL<<8 (cpu_reset)   +0x08 SCR_EL3 ao acordar   +0x10 0x22 (antes do eret)
++0x18 SCR_EL3 usado no eret   +0x20 0x33|EL (C em EL1)   +0x28 0x44|EL (flag marcado)   +0x30 &spin_table
+A CPU 0 zera a área antes e imprime no log o que enxerga depois. Ler no Linux:
+  regs 0x83e8fff00 0x40 64
+
+diff --git a/src/smp.c b/src/smp.c
+index 8c89751..7fe1241 100644
+--- a/src/smp.c
++++ b/src/smp.c
+@@ -57,6 +57,16 @@ extern u8 _vectors_start[0];
+ int boot_cpu_idx = -1;
+ u64 boot_cpu_mpidr = 0;
+ 
++/* Linux-no-iphone-6: pegadas do 2º núcleo no fim da região do log (16 KB em 0x83e8fc000) */
++#define SMP_MARCA 0x83e8fff00UL
++void smp_marca(int off, u64 v)
++{
++    write64(SMP_MARCA + off, v);
++    sysop("dsb sy");
++    __asm__ volatile("dc civac, %0" ::"r"(SMP_MARCA + off) : "memory");
++    sysop("dsb sy");
++}
++
+ void smp_secondary_entry(void)
+ {
+     struct spin_table *me = &spin_table[target_cpu];
+@@ -73,6 +83,8 @@ void smp_secondary_entry(void)
+     sysop("dmb sy");
+     me->flag = 1;
+     sysop("dmb sy");
++    smp_marca(0x28, 0x44 | (mrs(CurrentEL) << 8));
++    smp_marca(0x30, (u64)me);
+     u64 target;
+     if (!cpu_features->fast_ipi)
+         aic_write(AIC_IPI_MASK_SET, AIC_IPI_SELF); // we only use the "other" IPI
+@@ -156,6 +168,10 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
+ 
+     sysop("dsb sy");
+ 
++    for (int m = 0; m < 0x40; m += 8)          /* Linux-no-iphone-6: zera as pegadas */
++        write64(SMP_MARCA + m, 0);
++    dc_civac_range((void *)SMP_MARCA, 0x40);
++
+     if (cpu_features->apple_sysregs_unlocked) {
+         // This also clears RVBAR_LOCK, so that HV can set RVBAR later when the core is running
+         rvbar_set_entry(impl);
+@@ -182,6 +198,13 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
+     else
+         printf("  Started.\n");
+ 
++    /* Linux-no-iphone-6: o que a CPU 0 enxerga das pegadas e do flag */
++    printf("  pegadas (vistas pela CPU0): %lx %lx %lx %lx %lx %lx %lx\n",
++           read64(SMP_MARCA), read64(SMP_MARCA + 8), read64(SMP_MARCA + 0x10),
++           read64(SMP_MARCA + 0x18), read64(SMP_MARCA + 0x20), read64(SMP_MARCA + 0x28),
++           read64(SMP_MARCA + 0x30));
++    printf("  flag=%lx em %p\n", (u64)spin_table[index].flag, &spin_table[index]);
++
+     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
+     _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
+ }
+diff --git a/src/startup.c b/src/startup.c
+index 61afe16..5d1ce1e 100644
+--- a/src/startup.c
++++ b/src/startup.c
+@@ -216,8 +216,12 @@ void _start_c(void *boot_args, void *base)
+ }
+ 
+ /* Secondary SMP core boot */
++void smp_marca(int off, u64 v);
++
+ void _cpu_reset_c(void *stack)
+ {
++    if (!is_boot_cpu() && !in_el3())
++        smp_marca(0x20, 0x33 | (mrs(CurrentEL) << 8));   /* Linux-no-iphone-6 */
+     if (!is_boot_cpu())
+         uart_puts("RVBAR entry on secondary CPU");
+     else
+diff --git a/src/start.S b/src/start.S
+index aa11e18..7a97583 100644
+--- a/src/start.S
++++ b/src/start.S
+@@ -147,6 +147,19 @@ exc_unk:
+ .globl cpu_reset
+ .type cpu_reset, @function
+ cpu_reset:
++    /* Linux-no-iphone-6 (diagnóstico do 2º núcleo): pegada 0x11 + CurrentEL e, em
++     * EL3, o SCR_EL3 com que o núcleo acordou. MMU desligada: vai direto para a RAM. */
++    ldr x10, =0x83e8fff00
++    mrs x11, CurrentEL
++    lsl x12, x11, #8
++    add x12, x12, #0x11
++    str x12, [x10]
++    cmp x11, #0xc
++    b.ne 1f
++    mrs x12, scr_el3
++    str x12, [x10, #8]
++1:
++    dsb sy
+     mov w0, 'O'
+     bl debug_putc
+ 
+@@ -185,6 +198,12 @@ el3_eret_to_el1:
+     orr x8, x8, #(1<<10) // EL1 execution state is AArch64
+     orr x8, x8, #(1<<0)  // EL1 is non-secure
+     msr scr_el3, x8
++    /* Linux-no-iphone-6: pegada 0x22 + o SCR_EL3 que vamos usar para descer a EL1 */
++    ldr x10, =0x83e8fff00
++    mov x11, #0x22
++    str x11, [x10, #0x10]
++    str x8, [x10, #0x18]
++    dsb sy
+     msr elr_el3, x7 // Set EL1 entry point
+     mov x8, #0x5 // EL1h
+     msr spsr_el3, x8
