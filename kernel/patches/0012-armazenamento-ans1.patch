@@ -5,12 +5,16 @@ firmware que o iBoot deixou na RAM (descrito pelo m1n1 via alias 'asp').
 Protocolo do m1n1/HoolockLinux (src/ans1.c, proxyclient fw/ans1.py).
 Só leitura por padrão (parâmetro escrita=1 libera).
 
+Os buffers que o ANS lê e escreve (comandos e intermediário) são mapeados como
+memória Device: o memcache do A8 guarda cópias dos acessos Normal da CPU (com ou
+sem cache) e não vê as escritas do ANS; acessos Device passam por fora dele.
+
 diff --git b/drivers/block/apple-ans1.c b/drivers/block/apple-ans1.c
 new file mode 100644
-index 0000000..6d8d06b
+index 0000000..8d4f27b
 --- /dev/null
 +++ b/drivers/block/apple-ans1.c
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,816 @@
 +// SPDX-License-Identifier: GPL-2.0-only OR MIT
 +/*
 + * Armazenamento interno dos Apple A7/A8 ("ANS1"/ASP) como disco de blocos.
@@ -34,14 +38,12 @@ index 0000000..6d8d06b
 +#include <linux/blk-mq.h>
 +#include <linux/blkdev.h>
 +#include <linux/delay.h>
-+#include <linux/dma-mapping.h>
 +#include <linux/highmem.h>
 +#include <linux/io.h>
 +#include <linux/module.h>
 +#include <linux/of.h>
 +#include <linux/of_address.h>
 +#include <linux/platform_device.h>
-+#include <linux/scatterlist.h>
 +#include <linux/soc/apple/rtkit.h>
 +#include <linux/vmalloc.h>
 +
@@ -114,30 +116,105 @@ index 0000000..6d8d06b
 +MODULE_PARM_DESC(escrita, "permite ESCREVER na flash (padrão: só leitura)");
 +
 +/*
-+ * DADOS SEMPRE POR BUFFER INTERMEDIÁRIO SEM CACHE ("bounce").
-+ * Medido no iPhone 6: o ANS escreve na RAM por um caminho que NÃO passa pelo cache
-+ * do lado da memória (o de 4 MB do A8). A manutenção de cache do ARM (dc civac/ivac,
-+ * que o Linux faz no dma_map/unmap) não alcança esse cache: se ele tem uma cópia
-+ * da página (ex.: o programa acabou de preencher o buffer), a CPU lê a cópia velha
-+ * e depois ela volta para a RAM por cima dos dados. Resultado: 0/40 leituras certas
-+ * num buffer recém-escrito, 40/40 depois de varrer 8 MB para expulsar o cache.
-+ * Memória SEM cache (como o buffer de comandos) funciona nos dois sentidos; então
-+ * o ANS só fala com buffers sem cache e o driver copia para as páginas do Linux.
-+ * (O mesmo deve explicar o DMA do USB, que nunca funcionou neste iPhone.)
++ * O MEMCACHE (cache do lado da memória do A8) E O DMA DO ANS
++ *
++ * O ANS escreve na RAM por fora do memcache, mas a CPU passa por ele em todo acesso
++ * de memória "Normal", com ou sem cache: o memcache guarda cópias do que a CPU lê
++ * e descarrega, e depois a CPU lê essas cópias velhas em vez do que o ANS escreveu
++ * (e uma cópia suja pode até voltar para a RAM por cima dos dados). A manutenção
++ * de cache do ARM não alcança o memcache. Medido no iPhone 6:
++ *   - buffer recém-escrito pela CPU: 0/40 leituras certas; depois de varrer 8 MB
++ *     (expulsa o memcache): 40/40;
++ *   - resposta do identify (escrita pelo ANS no buffer de comandos) chegava pela
++ *     metade: só a linha que a CPU tinha lido antes vinha velha.
++ * Acessos de memória "Device" não passam pelo memcache. Então o ANS só lê e
++ * escreve em buffers mapeados como Device (comandos + intermediário), varridos uma
++ * vez na carga, e o driver copia entre eles e as páginas do Linux.
++ * (Muito provavelmente é também o motivo de o DMA do USB nunca ter funcionado.)
 + */
-+static bool varre = true;	/* até entendermos o cache do MCC: sem isso os dados vêm velhos */
-+module_param(varre, bool, 0644);
-+MODULE_PARM_DESC(varre, "varre 8 MB antes de ler respostas/dados do ANS (contorna o cache do lado da memória; padrão: sim)");
-+static u8 *varre_buf;
-+#define VARRE_TAM (8 << 20)
++#define ANS1_VARRE		(8 << 20)	/* > memcache (4 MB) */
 +
-+/* expulsa os caches (CPU e lado da memória) lendo e escrevendo 8 MB de outra memória */
++struct ans1_buf {
++	struct page *pg;
++	unsigned int ordem;
++	void *v;			/* mapeamento Device */
++	dma_addr_t fis;
++};
++
++/* páginas contíguas mapeadas como Device (nGnRnE): fora do memcache */
++static int ans1_buf_aloca(struct ans1_buf *b, size_t tam)
++{
++	unsigned int n = PAGE_ALIGN(tam) >> PAGE_SHIFT, i;
++	struct page **v;
++
++	b->ordem = get_order(tam);
++	b->pg = alloc_pages(GFP_KERNEL, b->ordem);
++	if (!b->pg)
++		return -ENOMEM;
++	v = kcalloc(n, sizeof(*v), GFP_KERNEL);
++	if (!v)
++		goto erro;
++	for (i = 0; i < n; i++)
++		v[i] = b->pg + i;
++	b->v = vmap(v, n, VM_MAP, pgprot_noncached(PAGE_KERNEL));
++	kfree(v);
++	if (!b->v)
++		goto erro;
++	memset_io((void __iomem *)b->v, 0, tam);
++	b->fis = page_to_phys(b->pg);
++	return 0;
++erro:
++	__free_pages(b->pg, b->ordem);
++	b->pg = NULL;
++	return -ENOMEM;
++}
++
++static void ans1_buf_libera(void *arg)
++{
++	struct ans1_buf *b = arg;
++
++	if (b->v)
++		vunmap(b->v);
++	if (b->pg)
++		__free_pages(b->pg, b->ordem);
++}
++
++/* expulsa do memcache cópias antigas das páginas recém-alocadas (uma vez, na carga) */
 +static void ans1_varre(void)
 +{
-+	if (!varre || !varre_buf)
++	u8 *v = vmalloc(ANS1_VARRE);
++
++	for (size_t i = 0; v && i < ANS1_VARRE; i += 64)
++		WRITE_ONCE(v[i], READ_ONCE(v[i]) + 1);
++	vfree(v);
++}
++
++/*
++ * Cópia rápida de memória Device (alinhada a 64 bytes): 4 ldp por iteração. O
++ * memcpy_fromio lê de 8 em 8 bytes e deixava a leitura em ~34 MB/s (assim, ~71).
++ */
++static void ans1_copia_dev(void *dst, const void *src, size_t n)
++{
++	const u64 *s64 = src;
++	u64 *d64 = dst;
++
++	if (((unsigned long)src | (unsigned long)dst | n) & 63) {
++		memcpy_fromio(dst, (const void __iomem *)src, n);
 +		return;
-+	for (size_t i = 0; i < VARRE_TAM; i += 64)
-+		WRITE_ONCE(varre_buf[i], READ_ONCE(varre_buf[i]) + 1);
++	}
++	for (; n; n -= 64, s64 += 8, d64 += 8) {
++		u64 a, b, c, d, e, f, g, h;
++
++		asm volatile("ldp %0, %1, [%8]\n\t"
++			     "ldp %2, %3, [%8, #16]\n\t"
++			     "ldp %4, %5, [%8, #32]\n\t"
++			     "ldp %6, %7, [%8, #48]"
++			     : "=&r"(a), "=&r"(b), "=&r"(c), "=&r"(d),
++			       "=&r"(e), "=&r"(f), "=&r"(g), "=&r"(h)
++			     : "r"(s64) : "memory");
++		d64[0] = a; d64[1] = b; d64[2] = c; d64[3] = d;
++		d64[4] = e; d64[5] = f; d64[6] = g; d64[7] = h;
++	}
 +}
 +
 +static bool depura;
@@ -158,10 +235,9 @@ index 0000000..6d8d06b
 +	struct apple_rtkit *rtk;
 +	u8 ep;
 +
-+	void *cmdbuf;
-+	dma_addr_t cmdbuf_dma;
-+	void *bounce;			/* ANS1_MAX_PAGES páginas por tag, sem cache */
-+	dma_addr_t bounce_dma;
++	struct ans1_buf cmdb;		/* comandos (ANS1_CMD_SIZE por tag), Device */
++	struct ans1_buf bounce;		/* ANS1_MAX_PAGES páginas por tag, Device */
++	/* sem IOMMU: o ANS usa endereços físicos; a lista de páginas tem 32 bits (<< 12) */
 +
 +	struct completion ready, cmdbuf_ready;
 +
@@ -179,7 +255,7 @@ index 0000000..6d8d06b
 +
 +static struct ans1_cmd_hdr *ans1_cmd(struct ans1 *ans, unsigned int tag)
 +{
-+	return ans->cmdbuf + tag * ANS1_CMD_SIZE;
++	return ans->cmdb.v + tag * ANS1_CMD_SIZE;
 +}
 +
 +static int ans1_send(struct ans1 *ans, u64 msg, bool atomic)
@@ -289,7 +365,7 @@ index 0000000..6d8d06b
 +	struct ans1_cmd_hdr *cmd = ans1_cmd(ans, 0);
 +	int ret, i;
 +
-+	memset(cmd, 0, ANS1_CMD_SIZE);
++	memset_io((void __iomem *)cmd, 0, ANS1_CMD_SIZE);
 +	cmd->op = op;
 +	cmd->flags = cpu_to_le16(flags);
 +	for (i = 0; i < n; i++)
@@ -336,7 +412,7 @@ index 0000000..6d8d06b
 +/* ---------- caminho de E/S (blk-mq) ---------- */
 +static void *ans1_bounce(struct ans1 *ans, unsigned int tag)
 +{
-+	return ans->bounce + (size_t)tag * ANS1_MAX_PAGES * ANS1_PAGE;
++	return ans->bounce.v + (size_t)tag * ANS1_MAX_PAGES * ANS1_PAGE;
 +}
 +
 +static blk_status_t ans1_queue_rq(struct blk_mq_hw_ctx *hctx,
@@ -346,7 +422,7 @@ index 0000000..6d8d06b
 +	struct ans1 *ans = hctx->queue->queuedata;
 +	struct ans1_rq *arq = blk_mq_rq_to_pdu(rq);
 +	struct ans1_cmd_hdr *cmd = ans1_cmd(ans, rq->tag);
-+	dma_addr_t b = ans->bounce_dma + (dma_addr_t)rq->tag * ANS1_MAX_PAGES * ANS1_PAGE;
++	dma_addr_t b = ans->bounce.fis + (dma_addr_t)rq->tag * ANS1_MAX_PAGES * ANS1_PAGE;
 +	unsigned int bytes = blk_rq_bytes(rq), npag = bytes / ANS1_PAGE, i;
 +	u8 op;
 +
@@ -374,18 +450,21 @@ index 0000000..6d8d06b
 +		return BLK_STS_IOERR;
 +	}
 +
-+	if (op == ANS1_OP_WRITE) {	/* dados do Linux -> buffer sem cache */
++	if (op == ANS1_OP_WRITE) {	/* páginas do Linux -> buffer intermediário */
 +		struct req_iterator it;
 +		struct bio_vec bv;
 +		char *d = ans1_bounce(ans, rq->tag);
 +
 +		rq_for_each_segment(bv, rq, it) {
-+			memcpy_from_bvec(d, &bv);
++			void *src = bvec_kmap_local(&bv);
++
++			memcpy_toio((void __iomem *)d, src, bv.bv_len);
++			kunmap_local(src);
 +			d += bv.bv_len;
 +		}
 +	}
 +
-+	memset(cmd, 0, ANS1_CMD_SIZE);
++	memset_io((void __iomem *)cmd, 0, ANS1_CMD_SIZE);
 +	for (i = 0; i < npag; i++)
 +		cmd->pages[i] = cpu_to_le32((b + i * ANS1_PAGE) >> 12);
 +	cmd->op = op;
@@ -422,9 +501,11 @@ index 0000000..6d8d06b
 +		const char *o = ans1_bounce(ans, rq->tag);
 +
 +		dma_rmb();
-+		ans1_varre();
-+		rq_for_each_segment(bv, rq, it) {	/* buffer sem cache -> páginas do Linux */
-+			memcpy_to_bvec(&bv, o);
++		rq_for_each_segment(bv, rq, it) {	/* buffer intermediário -> páginas do Linux */
++			void *dst = bvec_kmap_local(&bv);
++
++			ans1_copia_dev(dst, o, bv.bv_len);
++			kunmap_local(dst);
 +			o += bv.bv_len;
 +		}
 +		if (depura)
@@ -575,7 +656,7 @@ index 0000000..6d8d06b
 +	if (!wait_for_completion_timeout(&ans->ready, ANS1_TIMEOUT))
 +		return dev_err_probe(ans->dev, -ETIMEDOUT, "o ANS não ficou pronto\n");
 +
-+	ret = ans1_send(ans, FIELD_PREP(ANS1_CMDBUF_BASE, ans->cmdbuf_dma) |
++	ret = ans1_send(ans, FIELD_PREP(ANS1_CMDBUF_BASE, ans->cmdb.fis) |
 +			     FIELD_PREP(ANS1_CMDBUF_SIZE_17_6, (ntags * ANS1_CMD_SIZE) >> 6) |
 +			     FIELD_PREP(ANS1_MSG_TYPE, ANS1_MSG_SET_CMDBUF), false);
 +	if (ret)
@@ -600,16 +681,11 @@ index 0000000..6d8d06b
 +	u32 *r = (u32 *)ans1_cmd(ans, 0);
 +	int ret;
 +
-+	/*
-+	 * A resposta volta no próprio buffer de comando, mas às vezes chega pela
-+	 * metade (só +0x48 preenchido): mesmo problema de cache do lado da memória
-+	 * dos dados. Tenta de novo algumas vezes.
-+	 */
-+	for (int t = 0; t < 8; t++) {
++	/* a resposta volta no próprio buffer de comando; tenta de novo se vier incompleta */
++	for (int t = 0; t < 4; t++) {
 +		ret = ans1_sync(ans, ANS1_OP_IDENTIFY, 0, NULL, 0);
 +		if (ret)
 +			return ret;
-+		ans1_varre();
 +		ans->nr_lba = le32_to_cpu(READ_ONCE(r[0x30 / 4]));
 +		ans->lba_size = le32_to_cpu(READ_ONCE(r[0x34 / 4]));
 +		if (ans->nr_lba && ans->lba_size)
@@ -652,25 +728,21 @@ index 0000000..6d8d06b
 +	init_completion(&ans->cmdbuf_ready);
 +	init_completion(&ans->sync_done);
 +
-+	/* sem IOMMU: o ANS usa endereços físicos; a lista de páginas tem 32 bits (<< 12) */
-+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(44));
-+	if (ret)
-+		return ret;
-+
 +	ans->cpu = devm_platform_ioremap_resource(pdev, 0);
 +	if (IS_ERR(ans->cpu))
 +		return PTR_ERR(ans->cpu);
 +
-+	ans->cmdbuf = dmam_alloc_coherent(dev, ntags * ANS1_CMD_SIZE, &ans->cmdbuf_dma,
-+					  GFP_KERNEL);
-+	if (!ans->cmdbuf)
-+		return -ENOMEM;
-+	if (varre && !varre_buf)
-+		varre_buf = vzalloc(VARRE_TAM);
-+	ans->bounce = dmam_alloc_coherent(dev, (size_t)ntags * ANS1_MAX_PAGES * ANS1_PAGE,
-+					  &ans->bounce_dma, GFP_KERNEL);
-+	if (!ans->bounce)
-+		return dev_err_probe(dev, -ENOMEM, "sem memória para os buffers sem cache\n");
++	/* o firmware exige o buffer de comandos alinhado à página ("mbox.c:136 assert") */
++	ret = ans1_buf_aloca(&ans->cmdb, ntags * ANS1_CMD_SIZE);
++	if (!ret)
++		ret = devm_add_action_or_reset(dev, ans1_buf_libera, &ans->cmdb);
++	if (!ret)
++		ret = ans1_buf_aloca(&ans->bounce, (size_t)ntags * ANS1_MAX_PAGES * ANS1_PAGE);
++	if (!ret)
++		ret = devm_add_action_or_reset(dev, ans1_buf_libera, &ans->bounce);
++	if (ret)
++		return dev_err_probe(dev, ret, "sem memória para os buffers do ANS\n");
++	ans1_varre();
 +
 +	ans->rtk = devm_apple_rtkit_init(dev, ans, NULL, 0, &ans1_rtkit_ops);
 +	if (IS_ERR(ans->rtk))
