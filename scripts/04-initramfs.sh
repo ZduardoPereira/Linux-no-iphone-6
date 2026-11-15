@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Monta o initramfs: Alpine Linux mínimo (ARM64) + o nosso /init (rootfs/).
+# O initramfs é o "disco" do Linux no iPhone: vai inteiro na RAM, pelo USB.
+set -euo pipefail
+source "$(dirname "$0")/../config.sh"
+
+WORK="$BUILD/initramfs-root"
+rm -rf "$WORK" && mkdir -p "$WORK"
+
+log "Extraindo Alpine minirootfs"
+# --no-same-owner: estamos sem root; o dono vira root:root no cpio (-R 0:0)
+tar -xzf "$SRC/alpine-minirootfs.tar.gz" -C "$WORK" --no-same-owner --exclude='./dev/*'
+
+log "Copiando arquivos do projeto (rootfs/ por cima do Alpine)"
+cp -a "$ROOT/rootfs/." "$WORK/"
+chmod +x "$WORK/init"
+echo "$PHONE_IP" > "$WORK/etc/iphone6/phone_ip"   # vem do config.sh
+
+log "Gerando build/initramfs.gz"
+(cd "$WORK" && find . -print0 | cpio --null -o -H newc -R 0:0 --quiet) | gzip -9 > "$BUILD/initramfs.gz"
+log "Pronto ($(du -h "$BUILD/initramfs.gz" | cut -f1)). Próximo: ./scripts/05-empacotar.sh"

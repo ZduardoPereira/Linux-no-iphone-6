@@ -1,0 +1,32 @@
+diff --git a/drivers/usb/dwc2/params.c b/drivers/usb/dwc2/params.c
+index c6be27724..7bd0cfc4a 100644
+--- a/drivers/usb/dwc2/params.c
++++ b/drivers/usb/dwc2/params.c
+@@ -303,11 +303,27 @@ static void dwc2_set_stm32mp15_hsotg_params(struct dwc2_hsotg *hsotg)
+ 	p->hird_threshold_en = false;
+ }
+ 
++/*
++ * Linux-no-iphone-6: permite trocar DMA por PIO (slave mode) em tempo de execução, para
++ * diagnosticar o USB no iPhone 6 quando iniciado pelo pongoOS do checkra1n:
++ *   echo 1 > /sys/module/dwc2/parameters/apple_pio  e depois unbind/bind do dwc2.
++ */
++static bool apple_pio;
++module_param(apple_pio, bool, 0644);
++MODULE_PARM_DESC(apple_pio, "Apple A-series: use PIO (slave) mode instead of DMA");
++
+ static void dwc2_set_apple_silicon_params(struct dwc2_hsotg *hsotg)
+ {
+ 	struct dwc2_core_params *p = &hsotg->params;
+ 	unsigned fifo, fifo_count;
+ 
++	if (apple_pio) {
++		p->g_dma = false;
++		p->g_dma_desc = false;
++		p->host_dma = false;
++		dev_info(hsotg->dev, "apple_pio: usando PIO em vez de DMA\n");
++	}
++
+ 	p->speed = DWC2_SPEED_PARAM_HIGH;
+ 	p->power_down = DWC2_POWER_DOWN_PARAM_NONE;
+ 	p->g_rx_fifo_size = 539;

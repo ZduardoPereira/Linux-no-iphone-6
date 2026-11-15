@@ -1,0 +1,48 @@
+#!/bin/sh
+# /init — primeiro programa que o kernel executa (PID 1).
+# Se este script terminar, o kernel entra em pânico; por isso o laço no final.
+
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t configfs configfs /sys/kernel/config
+mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+mount -t tmpfs    tmpfs    /tmp
+hostname -F /etc/hostname
+
+echo
+echo "=========================================="
+echo "  Linux no iPhone 6 — $(uname -r)"
+echo "=========================================="
+
+. /etc/iphone6/usb-gadget.sh
+
+# Shell na porta serial USB (no PC: ./scripts/07-conectar.sh)
+( while true; do
+    [ -e /dev/ttyGS0 ] && setsid sh -c 'exec /bin/sh -l </dev/ttyGS0 >/dev/ttyGS0 2>&1'
+    sleep 1
+  done ) &
+
+# Monitor na tela: a cada 10 s, pacotes da rede USB e interrupções do controlador USB.
+# rx = recebidos do PC, tx = enviados ao PC. Ajuda a ver qual direção do USB falha.
+( sleep 40
+  # Retrato dos registradores do dwc2 (estado de cada endpoint), uma vez só
+  echo "[monitor] ===== dwc2 state ====="
+  cat /sys/kernel/debug/usb/*.usbdev/state 2>/dev/null | grep -vE "^\s*$" | head -40
+  echo "[monitor] ======================="
+) &
+( while true; do
+    sleep 10
+    n=/sys/class/net/usb0/statistics
+    irq="$(grep -m1 -i dwc2 /proc/interrupts | awk '{print $2}')"
+    echo "[monitor] usb0 rx=$(cat $n/rx_packets 2>/dev/null) tx=$(cat $n/tx_packets 2>/dev/null)" \
+         "err=$(cat $n/rx_errors 2>/dev/null)/$(cat $n/tx_errors 2>/dev/null) irq_usb=$irq" \
+         "udc=$(cat /sys/class/udc/*/state 2>/dev/null)"
+  done ) &
+
+echo "Pronto. No PC: ./scripts/07-conectar.sh"
+echo "IP do iPhone: $(cat /etc/iphone6/phone_ip)"
+
+# Mantém o PID 1 vivo e com um shell na tela (sem touch, a tela é só leitura)
+while true; do /bin/sh -l; done
