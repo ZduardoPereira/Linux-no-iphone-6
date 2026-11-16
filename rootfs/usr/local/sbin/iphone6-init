@@ -1,0 +1,73 @@
+#!/bin/sh
+# iphone6-init — 2º estágio do boot (PID 1): USB, SSH, serial, tela inicial.
+# Roda com o sistema na flash (depois do switch_root do /init) ou na RAM (sem flash).
+# Se este script terminar, o kernel entra em pânico; por isso o laço no final.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+monta() { mountpoint -q "$3" || mount -t "$1" "$2" "$3"; }
+monta devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+monta proc     proc     /proc
+monta sysfs    sysfs    /sys
+monta configfs configfs /sys/kernel/config
+mkdir -p /dev/pts && monta devpts devpts /dev/pts
+monta tmpfs    tmpfs    /tmp
+hostname -F /etc/hostname
+
+if grep -q '^/dev/mapper/linux / ' /proc/mounts; then
+  ONDE="sistema na flash interna"
+else
+  ONDE="sistema na RAM"
+fi
+echo
+echo "=========================================="
+echo "  Linux no iPhone 6 — $(uname -r)"
+echo "  $ONDE"
+echo "=========================================="
+
+. /etc/iphone6/usb-gadget.sh
+
+# SSH (dropbear): chaves do servidor criadas na 1ª vez (-R); login só com a chave do projeto
+mkdir -p /etc/dropbear
+dropbear -R -s -E 2>/tmp/dropbear.log && echo "SSH: ./scripts/ssh.sh (root@$(cat /etc/iphone6/phone_ip))"
+
+# Shell na porta serial USB (no PC: ./scripts/07-conectar.sh)
+( while true; do
+    [ -e /dev/ttyGS0 ] && setsid sh -c 'exec /bin/sh -l </dev/ttyGS0 >/dev/ttyGS0 2>&1'
+    sleep 1
+  done ) &
+
+# Tela inicial (LVGL, device/inicio). Espera o touch (o driver carrega o firmware
+# em segundo plano) e a reinicia se cair. Para voltar ao texto na tela:
+#   touch /tmp/sem-inicio; killall inicio
+( for i in $(seq 20); do
+    grep -qs "touchscreen" /sys/class/input/event*/device/name && break
+    sleep 0.5
+  done
+  while [ ! -e /tmp/sem-inicio ]; do
+    /usr/local/bin/inicio >/tmp/inicio.log 2>&1
+    sleep 2
+  done ) &
+
+# Flash interna. Com o sistema na flash ela já está montada (o /init fez isso).
+# Na RAM: monta o ext4 da janela em /mnt/flash, em segundo plano, sem formatar nada.
+# O driver põe o ANS para dormir sozinho depois do uso, e é isso que deixa desligar
+# sem aviso. "semflash" na linha de comando do kernel pula a flash.
+# (/proc/mounts e não "mountpoint": com o sistema na flash, / e /mnt/flash são o
+#  mesmo disco e o mountpoint do busybox acha que não é ponto de montagem)
+if grep -q ' /mnt/flash ' /proc/mounts; then
+  echo ok > /tmp/flash-estado
+elif ! grep -qw semflash /proc/cmdline; then
+  ( echo "montando..." > /tmp/flash-estado
+    if flash-linux montar > /tmp/flash.log 2>&1; then
+      echo ok > /tmp/flash-estado
+    else
+      echo "erro (ver /tmp/flash.log)" > /tmp/flash-estado
+    fi ) &
+fi
+
+echo "Pronto. No PC: ./scripts/07-conectar.sh"
+echo "IP do iPhone: $(cat /etc/iphone6/phone_ip)"
+
+# Mantém o PID 1 vivo; o shell no console aparece quando a tela inicial não está rodando
+while true; do /bin/sh -l; done

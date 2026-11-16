@@ -11,10 +11,10 @@ sem cache) e não vê as escritas do ANS; acessos Device passam por fora dele.
 
 diff --git b/drivers/block/apple-ans1.c b/drivers/block/apple-ans1.c
 new file mode 100644
-index 0000000..9c6a29e
+index 0000000..9375862
 --- /dev/null
 +++ b/drivers/block/apple-ans1.c
-@@ -0,0 +1,1114 @@
+@@ -0,0 +1,1145 @@
 +// SPDX-License-Identifier: GPL-2.0-only OR MIT
 +/*
 + * Armazenamento interno dos Apple A7/A8 ("ANS1"/ASP) como disco de blocos.
@@ -294,6 +294,24 @@ index 0000000..9c6a29e
 +module_param(cochilo_ms, uint, 0644);
 +MODULE_PARM_DESC(cochilo_ms, "ms sem uso até o ANS dormir (0 = nunca)");
 +
++/*
++ * Flush. Medido: dormir depois de escrever custa ~1,3 s (o firmware salva o contexto
++ * do FTL; o 0x14 de desligamento NVMe custa o mesmo), religar ~0,36 s, e um fsync do
++ * ext4 manda 2-3 flushes entremeados de escritas: dormir em cada um dava ~3 s, e o
++ * sync ainda terminava com o ANS ACORDADO (a última escrita o religa), que é o estado
++ * em que um corte de energia perde dados. Então, por padrão, o flush só encurta o
++ * cochilo: o ANS dorme UMA vez, cochilo_flush_ms depois do último pedido.
++ * Consistência: o dormir salva todas as escritas já concluídas e a fila está parada
++ * nesse momento, então o que sobrevive é sempre um prefixo do que foi escrito.
++ * flush_espera=1 volta ao flush que dorme na hora.
++ */
++static unsigned int cochilo_flush_ms = 100;
++module_param(cochilo_flush_ms, uint, 0644);
++MODULE_PARM_DESC(cochilo_flush_ms, "ms sem uso até dormir depois de um flush");
++static bool flush_espera;
++module_param(flush_espera, bool, 0644);
++MODULE_PARM_DESC(flush_espera, "flush dorme na hora (lento; o padrão adia para o cochilo)");
++
 +static bool depura;
 +module_param(depura, bool, 0644);
 +MODULE_PARM_DESC(depura, "registra cada comando e o começo dos dados lidos");
@@ -329,6 +347,7 @@ index 0000000..9c6a29e
 +	struct mutex estado;		/* dormindo / acordar / dormir */
 +	bool dormindo;			/* contexto salvo, CPU parada: seguro desligar */
 +	bool saindo;
++	bool flush_pendente;		/* houve flush: dormir logo (cochilo_flush_ms) */
 +	struct delayed_work cochilo;
 +	unsigned int acordou, dormiu;	/* contadores (sysfs não; só para o log) */
 +	const u8 *fw;			/* firmware limpo (__TEXT + __DATA inicial), ou NULL */
@@ -510,9 +529,15 @@ index 0000000..9c6a29e
 +{
 +	int ret;
 +
++	ktime_t t0 = ktime_get();
++
 +	if (init_iboot)
 +		ans1_init_iboot(ans);
++	if (depura)
++		dev_info(ans->dev, "init_iboot em %lld ms\n", ktime_ms_delta(ktime_get(), t0));
 +	ret = ans1_sync(ans, ANS1_OP_ABRE_IO, 0, NULL, 0);
++	if (depura)
++		dev_info(ans->dev, "0x1b (abre E/S) em %lld ms\n", ktime_ms_delta(ktime_get(), t0));
 +	if (ret)
 +		return ret;
 +	if (escrita_ate > escrita_de)
@@ -536,6 +561,7 @@ index 0000000..9c6a29e
 +	}
 +	ans1_cpu_stop(ans);
 +	ans->dormindo = true;
++	WRITE_ONCE(ans->flush_pendente, false);
 +	ans->dormiu++;
 +	if (depura)
 +		dev_info(ans->dev, "dormiu em %lld ms\n", ktime_ms_delta(ktime_get(), t0));
@@ -553,6 +579,8 @@ index 0000000..9c6a29e
 +	if (READ_ONCE(ans->morto))
 +		return -EIO;
 +	ret = ans1_boot(ans, true);
++	if (depura)
++		dev_info(ans->dev, "partida em %lld ms\n", ktime_ms_delta(ktime_get(), t0));
 +	if (!ret)
 +		ret = ans1_configura(ans);
 +	if (ret) {
@@ -586,6 +614,8 @@ index 0000000..9c6a29e
 +{
 +	unsigned int ms = READ_ONCE(cochilo_ms);
 +
++	if (READ_ONCE(ans->flush_pendente))
++		ms = READ_ONCE(cochilo_flush_ms) ?: 1;
 +	if (ms && !READ_ONCE(ans->saindo))
 +		mod_delayed_work(system_wq, &ans->cochilo, msecs_to_jiffies(ms));
 +}
@@ -610,17 +640,18 @@ index 0000000..9c6a29e
 +		return BLK_STS_IOERR;
 +
 +	if (req_op(rq) == REQ_OP_FLUSH) {
-+		/*
-+		 * O ANS só grava o contexto do FTL quando dorme de forma limpa (medido:
-+		 * dado salvo assim sobrevive a corte de energia). Flush = dormir; o
-+		 * próximo pedido religa.
-+		 */
-+		int ret;
++		/* ver cochilo_flush_ms: por padrão só agenda o dormir */
++		int ret = 0;
 +
 +		blk_mq_start_request(rq);
-+		mutex_lock(&ans->estado);
-+		ret = ans1_adormece(ans);
-+		mutex_unlock(&ans->estado);
++		if (READ_ONCE(flush_espera)) {
++			mutex_lock(&ans->estado);
++			ret = ans1_adormece(ans);
++			mutex_unlock(&ans->estado);
++		} else if (!ans->dormindo) {
++			WRITE_ONCE(ans->flush_pendente, true);
++			ans1_agenda_cochilo(ans);
++		}
 +		blk_mq_end_request(rq, ret ? BLK_STS_IOERR : BLK_STS_OK);
 +		return BLK_STS_OK;
 +	}

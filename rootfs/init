@@ -1,62 +1,47 @@
 #!/bin/sh
-# /init — primeiro programa que o kernel executa (PID 1).
-# Se este script terminar, o kernel entra em pânico; por isso o laço no final.
-
-# o kernel dá um PATH mínimo; os nossos programas ficam em /usr/local
+# /init — 1º estágio do boot, dentro do initramfs (que veio pelo USB, na RAM).
+#
+# Monta a flash interna e passa o sistema para lá (switch_root) para que o que se
+# instala e configura no iPhone (apk add, arquivos em /root...) fique salvo:
+#   1º boot:    copia este sistema da RAM para /mnt/flash/sistema (flash-linux instalar)
+#   todo boot:  recopia a "camada do projeto" (módulos do kernel, firmwares, nossos
+#               programas e scripts), para valer sempre o que foi compilado no PC
+# Sem flash (ou com "ram" ou "semflash" na linha de comando do kernel), o sistema
+# continua na RAM, como antes. O resto do boot é o 2º estágio: iphone6-init.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 mount -t devtmpfs devtmpfs /dev
 exec </dev/console >/dev/console 2>&1
-mount -t proc     proc     /proc
-mount -t sysfs    sysfs    /sys
-mount -t configfs configfs /sys/kernel/config
-mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
-mount -t tmpfs    tmpfs    /tmp
-hostname -F /etc/hostname
+mount -t proc  proc  /proc
+mount -t sysfs sysfs /sys
 
-echo
-echo "=========================================="
-echo "  Linux no iPhone 6 — $(uname -r)"
-echo "=========================================="
+ESTAGIO2=/usr/local/sbin/iphone6-init
+NOVA=/nova-raiz
 
-. /etc/iphone6/usb-gadget.sh
+na_ram() {
+  echo "init: $1 -> sistema na RAM"
+  mountpoint -q /mnt/flash && umount /mnt/flash
+  exec "$ESTAGIO2"
+}
 
-# SSH (dropbear): chaves do servidor geradas na hora (-R); login só com a chave do projeto
-mkdir -p /etc/dropbear
-dropbear -R -s -E 2>/tmp/dropbear.log && echo "SSH: ./scripts/ssh.sh (root@$(cat /etc/iphone6/phone_ip))"
+grep -qw -e ram -e semflash /proc/cmdline && na_ram "pedido na linha de comando"
+echo "init: montando a flash interna..."
+flash-linux montar || na_ram "flash não montou"
 
-# Shell na porta serial USB (no PC: ./scripts/07-conectar.sh)
-( while true; do
-    [ -e /dev/ttyGS0 ] && setsid sh -c 'exec /bin/sh -l </dev/ttyGS0 >/dev/ttyGS0 2>&1'
-    sleep 1
-  done ) &
-
-# Tela inicial (LVGL, device/inicio). Espera o touch (o driver carrega o firmware
-# em segundo plano) e a reinicia se cair. Para voltar ao texto na tela:
-#   touch /tmp/sem-inicio; killall inicio
-( for i in $(seq 20); do
-    grep -qs "touchscreen" /sys/class/input/event*/device/name && break
-    sleep 0.5
-  done
-  while [ ! -e /tmp/sem-inicio ]; do
-    /usr/local/bin/inicio >/tmp/inicio.log 2>&1
-    sleep 2
-  done ) &
-
-# Flash interna: monta o ext4 da janela em /mnt/flash, em segundo plano. Não formata
-# nada sozinho. O driver põe o ANS para dormir 2 s depois do último uso, e é isso
-# que deixa desligar sem aviso. Para pular: "semflash" na linha de comando do kernel.
-if ! grep -qw semflash /proc/cmdline; then
-  ( echo "montando..." > /tmp/flash-estado
-    if flash-linux montar > /tmp/flash.log 2>&1; then
-      echo ok > /tmp/flash-estado
-    else
-      echo "erro (ver /tmp/flash.log)" > /tmp/flash-estado
-    fi ) &
+if [ ! -e /mnt/flash/sistema/bin/busybox ]; then
+  echo "init: 1º boot com a flash: instalando o sistema"
+  flash-linux instalar || na_ram "instalação falhou"
 fi
+flash-linux atualizar || na_ram "atualização falhou"
+[ -x "/mnt/flash/sistema$ESTAGIO2" ] || na_ram "sistema na flash incompleto"
 
-echo "Pronto. No PC: ./scripts/07-conectar.sh"
-echo "IP do iPhone: $(cat /etc/iphone6/phone_ip)"
-
-# Mantém o PID 1 vivo; o shell no console aparece quando a tela inicial não está rodando
-while true; do /bin/sh -l; done
+# raiz nova = /mnt/flash/sistema; o ext4 inteiro continua visível em /mnt/flash
+mkdir -p "$NOVA"
+mount --bind /mnt/flash/sistema "$NOVA" || na_ram "bind falhou"
+mount --move /mnt/flash "$NOVA/mnt/flash"
+mount --move /dev  "$NOVA/dev"
+mount --move /proc "$NOVA/proc"
+mount --move /sys  "$NOVA/sys"
+echo "init: sistema na flash interna"
+# switch_root apaga o initramfs (libera a RAM) e roda o 2º estágio como PID 1
+exec switch_root "$NOVA" "$ESTAGIO2"

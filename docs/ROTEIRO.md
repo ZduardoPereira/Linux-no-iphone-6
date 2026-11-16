@@ -186,11 +186,27 @@ HoolockLinux (m1n1 `src/ans1.c`, `proxyclient/m1n1/fw/ans1.py`).
     nada → os 3 arquivos voltaram íntegros (o ext4 só repassa o journal)
   - cuidado: cortar a CPU do ANS durante a partida dele trava o chip NAND até um reboot
 - [x] `flash-linux formatar` / `montar` / `desligar`: ext4 de 94 GB em `/mnt/flash`
-- [ ] `sync` caro (~6 s num arquivo pequeno: cada flush do ext4 dorme e acorda o ANS)
+- [x] `sync` rápido: 0,3–0,8 s num arquivo pequeno (era ~3 s). Medido: dormir depois de
+      escrever custa ~1,3 s (salvar o contexto; o 0x14 custa o mesmo), religar 0,36 s, e o
+      fsync do ext4 manda 2–3 flushes. O flush agora só antecipa o cochilo (0,1 s depois do
+      último pedido): o ANS dorme uma vez e os dados ficam seguros ~1,5 s depois do sync
+      (antes o sync terminava com o ANS acordado). `flush_espera=1` volta ao modo antigo
 - [x] O `/init` monta a flash em `/mnt/flash` sozinho no boot, em segundo plano (não formata
       nada; `semflash` na linha de comando do kernel pula). Tela inicial: cartão "Flash
       interna" (espaço livre) e botão **Desligar** (salva a flash; "Voltar" remonta)
-- [ ] Não iniciar o iOS de novo (ele poderia ocupar o espaço da janela)
+- [x] **Sistema na flash** (16/11/2026): o `/init` do initramfs monta a flash, instala o
+      sistema em `/mnt/flash/sistema` no 1º boot (`flash-linux instalar`), recopia a cada
+      boot a camada do projeto (módulos, firmwares, `/usr/local`, scripts:
+      `flash-linux atualizar`) e faz `switch_root`. `apk add` e arquivos ficam salvos; a RAM
+      do initramfs é liberada (24 MB em uso em vez de ~80). Sem flash, ou com `ram` na linha
+      de comando do kernel, tudo continua na RAM. `desligar` trava a flash (somente leitura)
+- [x] Perdas em série resolvidas: depois que o iOS ligou uma vez sem ninguém ver (cortado no
+      meio), o iBoot passou a gravar muito na NVRAM a cada boot e atropelava os nossos dados.
+      Ligar o iOS e desligar **pelo menu** resolveu. Regra: se o iOS ligar sem querer, ligá-lo
+      e desligá-lo pelo menu antes de confiar na flash, e reconferir com `host/apfs_livre.py`.
+      Saúde: no log do ANS, `Location [5,N] for element NVRAM` deve andar ~1 por boot
+- [x] **Nunca** mandar o opcode 0x14 (desligamento NVMe) com uso depois: o boot seguinte
+      recusou o log ("DM sequence in CLog didn't match") e a janela se perdeu
 
 ## Fase 6: Android
 O Android é um kernel Linux + um userspace próprio (init do Android, Binder, SurfaceFlinger, ART).

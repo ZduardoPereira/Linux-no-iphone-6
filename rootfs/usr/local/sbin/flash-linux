@@ -3,22 +3,89 @@
 #   flash-linux             carrega o driver e cria /dev/mapper/linux
 #   flash-linux montar      ... e monta o ext4 em /mnt/flash
 #   flash-linux formatar    APAGA a janela e cria um ext4 novo (sem montar)
-#   flash-linux desligar    desmonta e põe o ANS para dormir (faça antes do DFU)
+#   flash-linux instalar    copia o sistema da RAM para /mnt/flash/sistema (1º boot)
+#   flash-linux atualizar   recopia a "camada do projeto" (módulos, firmwares, nossos
+#                           programas e scripts) da RAM para /mnt/flash/sistema
+#   flash-linux desligar    deixa a flash pronta para cortar a energia
+#   flash-linux religar     desfaz o "desligar"
 # A janela vem de /etc/modprobe.d/apple-ans1.conf (blocos de 4 KB do disco).
 #
 # Durabilidade: a flash só aguenta um corte de energia de verdade (DFU, bateria) se
 # o ANS estiver DORMINDO. O driver o põe para dormir sozinho depois de 2 s sem uso
-# (parâmetro cochilo_ms) e a cada sync/fsync. Desligar no meio de uma gravação
-# pode fazer o boot seguinte voltar para um estado antigo.
+# (cochilo_ms) e ~0,1 s depois que um sync/fsync termina (cochilo_flush_ms): os
+# dados ficam seguros ~1,5 s depois do sync. Desligar no meio de uma gravação pode
+# fazer o boot seguinte voltar para um estado antigo.
 set -e
-if [ "$1" = desligar ]; then
+SISTEMA=/mnt/flash/sistema
+
+# o sistema (/) está na flash? (boot com switch_root feito pelo /init)
+raiz_na_flash() { grep -q '^/dev/mapper/linux / ' /proc/mounts; }
+
+# CPU do ANS parada = dormindo (só ler com o driver carregado: com o domínio de
+# energia desligado, ler este registrador TRAVA o iPhone)
+espera_ans_dormir() {
+    lsmod | grep -q '^apple_ans1 ' || return 0
+    for i in $(seq 50); do
+        [ "$(regs 0x208040028 | cut -d' ' -f2)" = 00000000 ] && return 0
+        sleep 0.1
+    done
+    echo "flash-linux: o ANS não dormiu em 5 s"; return 1
+}
+
+case "$1" in
+desligar)
     sync
-    umount /mnt/flash 2>/dev/null || true
-    dmsetup remove linux 2>/dev/null || true
-    rmmod apple_ans1 2>/dev/null || true
-    echo "flash-linux: flash salva e ANS dormindo; pode desligar/reiniciar"
-    exit 0
-fi
+    if raiz_na_flash; then
+        # não dá para desmontar o sistema em uso: trava como somente leitura
+        mount -o remount,ro /mnt/flash
+        espera_ans_dormir
+        echo "flash-linux: flash travada (somente leitura) e ANS dormindo; pode desligar/reiniciar"
+    else
+        umount /mnt/flash 2>/dev/null || true
+        dmsetup remove linux 2>/dev/null || true
+        rmmod apple_ans1 2>/dev/null || true
+        echo "flash-linux: flash salva e ANS dormindo; pode desligar/reiniciar"
+    fi
+    exit 0 ;;
+religar)
+    if raiz_na_flash; then
+        mount -o remount,rw /mnt/flash
+        echo "flash-linux: flash liberada para escrita"
+        exit 0
+    fi
+    exec "$0" montar ;;
+instalar)
+    [ -d /mnt/flash/lost+found ] || { echo "flash-linux: monte a flash antes"; exit 1; }
+    [ -e "$SISTEMA/bin/busybox" ] && { echo "flash-linux: $SISTEMA já existe"; exit 1; }
+    raiz_na_flash && { echo "flash-linux: o sistema já está na flash"; exit 1; }
+    echo "flash-linux: copiando o sistema da RAM para $SISTEMA..."
+    rm -rf "$SISTEMA.novo"; mkdir -p "$SISTEMA.novo"
+    for d in /*; do
+        case "$d" in /dev|/proc|/sys|/tmp|/mnt|/run|/init) continue ;; esac
+        cp -a "$d" "$SISTEMA.novo/"
+    done
+    mkdir -p "$SISTEMA.novo/dev" "$SISTEMA.novo/proc" "$SISTEMA.novo/sys" \
+             "$SISTEMA.novo/tmp" "$SISTEMA.novo/run" "$SISTEMA.novo/mnt/flash"
+    chmod 1777 "$SISTEMA.novo/tmp"
+    sync
+    mv "$SISTEMA.novo" "$SISTEMA"          # só vira "instalado" depois de completo
+    sync
+    echo "flash-linux: sistema instalado ($(du -sh "$SISTEMA" | cut -f1))"
+    exit 0 ;;
+atualizar)
+    [ -e "$SISTEMA/bin/busybox" ] || { echo "flash-linux: sistema não instalado"; exit 1; }
+    raiz_na_flash && { echo "flash-linux: rode só a partir da RAM (o /init faz isso)"; exit 1; }
+    # o que vem do PC a cada boot; os pacotes do Alpine (apk add) ficam como estão
+    for p in /usr/local /etc/iphone6 /etc/modprobe.d /etc/profile.d /etc/hostname \
+             /lib/modules /lib/firmware/apple /root/.ssh /root/n1.py /root/adt.py; do
+        [ -e "$p" ] || continue
+        mkdir -p "$SISTEMA$(dirname "$p")"
+        rm -rf "$SISTEMA$p"
+        cp -a "$p" "$SISTEMA$p"
+    done
+    exit 0 ;;
+esac
+
 modprobe apple-ans1
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/ans0 ] && break; sleep 0.5; done
 [ -b /dev/ans0 ] || { echo "flash-linux: /dev/ans0 não apareceu (dmesg | grep ans1)"; exit 1; }
@@ -37,6 +104,7 @@ if [ "$1" = formatar ]; then
 fi
 if [ "$1" = montar ]; then
     mkdir -p /mnt/flash
-    # commit=30: cada salvamento (flush) custa ~1 s ao ANS
-    mount -t ext4 -o commit=30 /dev/mapper/linux /mnt/flash && echo "flash-linux: montado em /mnt/flash"
+    # noatime: ler um arquivo não vira escrita (cada escrita acorda o ANS)
+    # commit=30: o journal salva a cada 30 s
+    mount -t ext4 -o noatime,commit=30 /dev/mapper/linux /mnt/flash && echo "flash-linux: montado em /mnt/flash"
 fi

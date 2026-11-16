@@ -326,7 +326,7 @@ static void abre_desligar(lv_event_t *e)
     lv_obj_set_flex_align(capa_botoes, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_label_set_text(capa_titulo, LV_SYMBOL_POWER "  Desligar?");
-    lv_label_set_text(capa_texto, "A flash interna é salva e desmontada. Depois é só "
+    lv_label_set_text(capa_texto, "A flash interna é salva e travada. Depois é só "
                                   "segurar Power + Home até a tela apagar.");
     botao(capa_botoes, "Cancelar", capa_fecha, 0x343a4a);
     botao(capa_botoes, LV_SYMBOL_POWER "  Desligar", capa_confirma, 0xc92a2a);
@@ -346,8 +346,8 @@ static void capa_confirma(lv_event_t *e)
 
 static void capa_volta(lv_event_t *e)
 {
-    capa_mostra(LV_SYMBOL_REFRESH "  Montando...", "Religando a flash interna.");
-    roda("/usr/local/sbin/flash-linux montar >/tmp/flash.log 2>&1 && echo ok >/tmp/flash-estado");
+    capa_mostra(LV_SYMBOL_REFRESH "  Religando...", "Liberando a flash interna.");
+    roda("/usr/local/sbin/flash-linux religar >/tmp/flash.log 2>&1 && echo ok >/tmp/flash-estado");
     capa_fecha(e);
 }
 
@@ -413,9 +413,9 @@ static void monta_tela(void)
     lv_slider_set_value(slider, le_num(BRILHO "brightness", 1500) * 100 / brilho_max, LV_ANIM_OFF);
     lv_obj_add_event_cb(slider, ao_mudar_brilho, LV_EVENT_VALUE_CHANGED, NULL);
 
-    lv_obj_set_width(botao(grade, LV_SYMBOL_BELL "  Vibrar", vibrar, 0x3b5bdb), lv_pct(31));
-    lv_obj_set_width(botao(grade, LV_SYMBOL_EDIT "  Desenho", abre_desenho, 0x0ca678), lv_pct(31));
-    lv_obj_set_width(botao(grade, LV_SYMBOL_POWER "  Desligar", abre_desligar, 0xc92a2a), lv_pct(31));
+    lv_obj_set_width(botao(grade, LV_SYMBOL_BELL "  Vibrar", vibrar, 0x3b5bdb), lv_pct(30));
+    lv_obj_set_width(botao(grade, LV_SYMBOL_EDIT "  Desenho", abre_desenho, 0x0ca678), lv_pct(30));
+    lv_obj_set_width(botao(grade, LV_SYMBOL_POWER "  Desligar", abre_desligar, 0xc92a2a), lv_pct(30));
 }
 
 /* ---------- botões físicos ---------- */
