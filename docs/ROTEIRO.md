@@ -24,7 +24,12 @@ Cada fase ensina uma camada do sistema. Não pule fases: o Android depende de to
 4. Em PIO, o envio travava por um **bug no driver dwc2**: `DTXFSTS` lido pelo número
    do FIFO em vez do número do endpoint (patch `kernel/patches/0002`). Candidato a
    ser enviado ao kernel oficial.
-5. Atrapalham no PC: driver `apple_mfi_fastcharge`, `usbmuxd` e ModemManager
+5. Outro bug do dwc2 em PIO: um SETUP que chega com o ep0 fora do estado SETUP era
+   copiado para o buffer do pedido anterior **sem limite de tamanho** (corrupção de
+   memória → boot travando em "new address 1", e o "cdc_ncm bind() failure" no PC).
+   Patch `kernel/patches/0014`: SETUP novo aborta a transferência em andamento (como
+   manda o USB 2.0) e a cópia nunca passa do buffer.
+6. Atrapalham no PC: driver `apple_mfi_fastcharge`, `usbmuxd` e ModemManager
    (ver `host/70-linux-no-iphone6.rules`).
 
 ### Pendências da fase 1
@@ -133,7 +138,7 @@ github.com/ITSMEFRTRUST/linux-on-iphone6 (engenharia reversa do iOS); conferido 
     abre o Desenho. Power apaga a tela, Volume muda o brilho. Parado: 0% de CPU, ~5 MB de RAM
   - L4: sobe sozinha no boot (`rootfs/init`); `touch /tmp/sem-inicio; killall inicio` volta ao texto ✅
 
-## Fase 7: Armazenamento interno (flash de 128 GB) ← leitura ✅, escrita pendente
+## Fase 7: Armazenamento interno (flash de 128 GB) ← leitura, escrita, ext4 e durabilidade ✅
 No A8 a flash é do **ANS**, um coprocessador ARM com firmware próprio (carregado pelo iBoot
 na RAM). Não é NVMe: o driver NVMe da Apple é do A11 em diante. Protocolo descoberto pela
 HoolockLinux (m1n1 `src/ans1.c`, `proxyclient/m1n1/fw/ans1.py`).
@@ -155,7 +160,37 @@ HoolockLinux (m1n1 `src/ans1.c`, `proxyclient/m1n1/fw/ans1.py`).
   política do memcache por "data set ID" (MCC 0x2000N_X000 = 0x111); `HID8` data set ID
   da CPU 15→0. Ferramentas de teste em `docs/ans1-testes/`
 - [ ] USB por DMA: provavelmente o mesmo memcache (o dwc2 escreve buffers Normal)
-- [ ] Escrita (com confirmação: apaga o iOS)
+- [x] O boot depende do iOS na flash: o iBoot carrega dele o kernel, TrustCache, firmware do
+      SEP e DeviceTree (ADT `/chosen/memory-map`) antes do pongo. Então **não apagamos o iOS**
+- [x] Espaço livre do APFS lido com `host/apfs_livre.py` (só leitura, checksums ok): iOS usa
+      6,6 GB; maior região livre 107 GB (blocos 4.128.768–30.244.864 da partição)
+- [x] **Escrita** ✅ só numa janela de 96 GB dentro do livre (blocos de disco 4.194.310–
+      29.360.134); o driver recusa qualquer escrita fora dela. 64 MB a 92,7 MB/s, lidos de
+      volta idênticos; persistem ao recarregar o driver
+- [x] **Durabilidade** ✅ (depois de muita investigação):
+  - o iBoot carrega o firmware do ANS (embutido nele, criptografado; chave pública) e o
+    **desliga** antes do pongo; dar a partida na cópia já usada fazia o firmware se
+    recuperar a cada sessão e, num desligamento sem aviso, **voltar no tempo**
+  - `scripts/11-firmware-ans.sh` extrai o **firmware limpo** do iBoot do IPSW; o driver o
+    recarrega antes de cada partida, preservando a tabela de parâmetros que o iBoot preenche
+    (SOC_, ANCC = clock da flash, RHB0/RHS0…)
+  - opcodes achados desmontando o iBoot e o firmware: **0x1b** abre a E/S (montagem do FTL),
+    **0x19** libera a escrita (o firmware parte trancado), **0x14** é desligamento final (não usar)
+  - corte simulado (CPU do ANS parada + domínio desligado) **nunca** perdeu nada, nem 1 GB
+    sem flush; o corte **de verdade** (DFU) com o ANS acordado fazia o boot seguinte voltar
+    para um estado antigo (o chip NAND tem controlador próprio e perde estado volátil)
+  - solução, como no iOS: **cochilo** — 2 s sem pedidos (`cochilo_ms`), o driver põe o ANS
+    para dormir de forma limpa e para a CPU dele; o próximo pedido religa (~0,95 s, com o
+    firmware limpo). Flush = dormir
+  - **confirmado com reboot de verdade (16/11/2026)**: ext4 montado, `sync`, DFU sem desligar
+    nada → os 3 arquivos voltaram íntegros (o ext4 só repassa o journal)
+  - cuidado: cortar a CPU do ANS durante a partida dele trava o chip NAND até um reboot
+- [x] `flash-linux formatar` / `montar` / `desligar`: ext4 de 94 GB em `/mnt/flash`
+- [ ] `sync` caro (~6 s num arquivo pequeno: cada flush do ext4 dorme e acorda o ANS)
+- [x] O `/init` monta a flash em `/mnt/flash` sozinho no boot, em segundo plano (não formata
+      nada; `semflash` na linha de comando do kernel pula). Tela inicial: cartão "Flash
+      interna" (espaço livre) e botão **Desligar** (salva a flash; "Voltar" remonta)
+- [ ] Não iniciar o iOS de novo (ele poderia ocupar o espaço da janela)
 
 ## Fase 6: Android
 O Android é um kernel Linux + um userspace próprio (init do Android, Binder, SurfaceFlinger, ART).

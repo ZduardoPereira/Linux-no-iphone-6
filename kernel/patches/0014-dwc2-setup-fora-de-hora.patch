@@ -1,0 +1,92 @@
+usb: dwc2: SETUP fora de hora no ep0 não corrompe memória
+
+diff --git a/drivers/usb/dwc2/gadget.c b/drivers/usb/dwc2/gadget.c
+index b6cc081..5e9fcac 100644
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -1883,6 +1883,8 @@ static int dwc2_hsotg_process_req_feature(struct dwc2_hsotg *hsotg,
+ }
+ 
+ static void dwc2_hsotg_enqueue_setup(struct dwc2_hsotg *hsotg);
++static void kill_all_requests(struct dwc2_hsotg *hsotg,
++			      struct dwc2_hsotg_ep *ep, int result);
+ 
+ /**
+  * dwc2_hsotg_stall_ep0 - stall ep0
+@@ -2262,6 +2264,7 @@ static void dwc2_gadget_handle_isoc_bna(struct dwc2_hsotg_ep *hs_ep)
+  */
+ static void dwc2_hsotg_rx_data(struct dwc2_hsotg *hsotg, int ep_idx, int size)
+ {
++	int ptr;
+ 	struct dwc2_hsotg_ep *hs_ep = hsotg->eps_out[ep_idx];
+ 	struct dwc2_hsotg_req *hs_req = hs_ep->req;
+ 	int to_read;
+@@ -2270,7 +2273,6 @@ static void dwc2_hsotg_rx_data(struct dwc2_hsotg *hsotg, int ep_idx, int size)
+ 
+ 	if (!hs_req) {
+ 		u32 epctl = dwc2_readl(hsotg, DOEPCTL(ep_idx));
+-		int ptr;
+ 
+ 		dev_dbg(hsotg->dev,
+ 			"%s: FIFO %d bytes on ep%d but no req (DXEPCTl=0x%08x)\n",
+@@ -2292,24 +2294,28 @@ static void dwc2_hsotg_rx_data(struct dwc2_hsotg *hsotg, int ep_idx, int size)
+ 
+ 	if (to_read > max_req) {
+ 		/*
+-		 * more data appeared than we where willing
+-		 * to deal with in this request.
++		 * More data than this request can hold. Copying it all would write
++		 * past the end of the buffer (seen on ep0 of the A8 in PIO mode when
++		 * a SETUP arrives in the wrong state): keep what fits, drop the rest.
+ 		 */
+-
+-		/* currently we don't deal this */
+-		WARN_ON_ONCE(1);
++		dev_warn_ratelimited(hsotg->dev, "%s: ep%d: %d bytes in the FIFO, room for %d\n",
++				     __func__, ep_idx, to_read, max_req);
++		to_read = max_req;
+ 	}
+ 
+ 	hs_ep->total_data += to_read;
+ 	hs_req->req.actual += to_read;
+-	to_read = DIV_ROUND_UP(to_read, 4);
+ 
+-	/*
+-	 * note, we might over-write the buffer end by 3 bytes depending on
+-	 * alignment of the data.
+-	 */
+-	dwc2_readl_rep(hsotg, EPFIFO(ep_idx),
+-		       hs_req->req.buf + read_ptr, to_read);
++	/* whole words straight into the buffer, the tail through a bounce word */
++	dwc2_readl_rep(hsotg, EPFIFO(ep_idx), hs_req->req.buf + read_ptr, to_read / 4);
++	if (to_read % 4) {
++		u32 w = dwc2_readl(hsotg, EPFIFO(ep_idx));
++
++		memcpy(hs_req->req.buf + read_ptr + (to_read & ~3), &w, to_read % 4);
++	}
++	/* whatever did not fit still has to leave the FIFO */
++	for (ptr = DIV_ROUND_UP(to_read, 4); ptr < DIV_ROUND_UP(size, 4); ptr++)
++		(void)dwc2_readl(hsotg, EPFIFO(ep_idx));
+ }
+ 
+ /**
+@@ -2531,7 +2537,18 @@ static void dwc2_hsotg_handle_rx(struct dwc2_hsotg *hsotg)
+ 			dwc2_hsotg_read_frameno(hsotg),
+ 			dwc2_readl(hsotg, DOEPCTL(0)));
+ 
+-		WARN_ON(hsotg->ep0_state != DWC2_EP0_SETUP);
++		/*
++		 * A new SETUP always aborts the control transfer in progress (USB 2.0
++		 * 8.5.3). Without this, the 8 bytes went into the buffer of whatever
++		 * ep0 request was queued (the A8 in PIO mode hits this during
++		 * enumeration) and the SETUP itself was lost.
++		 */
++		if (hsotg->ep0_state != DWC2_EP0_SETUP) {
++			dev_dbg(hsotg->dev, "SETUP in ep0 state %d: restarting ep0\n",
++				hsotg->ep0_state);
++			kill_all_requests(hsotg, hsotg->eps_out[0], -ECONNRESET);
++			dwc2_hsotg_enqueue_setup(hsotg);
++		}
+ 
+ 		dwc2_hsotg_rx_data(hsotg, epnum, size);
+ 		break;

@@ -3,8 +3,10 @@
  *
  * Mostra, ao vivo, o que os nossos drivers leem do hardware:
  *   bateria (bq27540-battery), carregador (sn2400-usb), temperatura (apple_temp_*),
- *   brilho (backlight), vibração (drv260x, via /usr/local/bin/vibrar), sistema.
+ *   brilho (backlight), vibração (drv260x, via /usr/local/bin/vibrar), sistema,
+ *   flash interna (ext4 em /mnt/flash, montado pelo /init com flash-linux).
  * Botões físicos: Power apaga/acende a tela, Volume +/- muda o brilho.
+ * Botão "Desligar": salva a flash (flash-linux desligar) antes de cortar a energia.
  *
  * Desenho: LVGL v9 no /dev/fb0 (driver lv_linux_fbdev) e toque pelo /dev/input
  * (lv_evdev). O laço principal dorme até o próximo evento do LVGL ou um botão.
@@ -19,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -90,6 +93,7 @@ static int temp_max(void)
 /* ---------- interface ---------- */
 static lv_obj_t *l_hora, *l_bat, *l_relogio, *l_data;
 static lv_obj_t *v_bat, *d_bat, *v_temp, *d_temp, *v_sis, *d_sis, *v_usb, *d_usb;
+static lv_obj_t *v_flash, *d_flash;
 static lv_obj_t *slider;
 static long brilho_max = 2047;
 
@@ -97,7 +101,7 @@ static lv_obj_t *cartao(lv_obj_t *pai, const char *icone, const char *titulo,
                         lv_obj_t **valor, lv_obj_t **detalhe)
 {
     lv_obj_t *c = lv_obj_create(pai);
-    lv_obj_set_size(c, lv_pct(48), 210);
+    lv_obj_set_size(c, lv_pct(48), 180);
     lv_obj_set_style_radius(c, 28, 0);
     lv_obj_set_style_bg_color(c, lv_color_hex(0x1e2433), 0);
     lv_obj_set_style_border_width(c, 0, 0);
@@ -141,6 +145,8 @@ static void retoma_tela(void)
         lv_obj_invalidate(lv_screen_active());
     }
 }
+
+static int flash_montada(void);
 
 static void atualiza(lv_timer_t *t)
 {
@@ -188,6 +194,31 @@ static void atualiza(lv_timer_t *t)
     long online = le_num(USB "online", 0), ma = le_num(USB "current_now", 0) / 1000;
     lv_label_set_text(v_usb, online ? "USB" : "--");
     lv_label_set_text_fmt(d_usb, online ? "cabo conectado · %ld mA de entrada" : "sem cabo", ma);
+
+    /* flash: só a contagem do superbloco em memória (statvfs não acorda o ANS) */
+    struct statvfs sv;
+    if (flash_montada() && statvfs("/mnt/flash", &sv) == 0) {
+        unsigned long long bs = sv.f_frsize;
+        unsigned long long livre = sv.f_bavail * bs / 100000000ULL;   /* décimos de GB */
+        unsigned long long total = sv.f_blocks * bs / 1000000000ULL;
+        lv_label_set_text_fmt(v_flash, "%llu,%llu GB", livre / 10, livre % 10);
+        lv_label_set_text_fmt(d_flash, "livres de %llu GB · ext4 em /mnt/flash", total);
+    } else {
+        le_txt("/tmp/flash-estado", s, sizeof(s));
+        lv_label_set_text(v_flash, "--");
+        lv_label_set_text_fmt(d_flash, "não montada%s%s", s[0] ? " · " : "", s);
+    }
+}
+
+static int flash_montada(void)
+{
+    char linha[256];
+    int sim = 0;
+    FILE *f = fopen("/proc/mounts", "r");
+    while (f && !sim && fgets(linha, sizeof(linha), f))
+        sim = strstr(linha, " /mnt/flash ") != NULL;
+    if (f) fclose(f);
+    return sim;
 }
 
 static void ao_mudar_brilho(lv_event_t *e)
@@ -222,6 +253,102 @@ static void abre_desenho(lv_event_t *e)
     retoma_tela();
     toque = lv_evdev_create(LV_INDEV_TYPE_POINTER, toque_dev);
     lv_obj_invalidate(lv_screen_active());
+}
+
+/* roda um comando do shell e espera (a tela fica parada enquanto isso) */
+static int roda(const char *cmd)
+{
+    int st = -1;
+    pid_t p = fork();
+    if (p == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    if (p > 0) waitpid(p, &st, 0);
+    return p > 0 && WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* ---------- desligar: capa sobre a tela inteira ---------- */
+static lv_obj_t *capa, *capa_titulo, *capa_texto, *capa_botoes;
+
+static lv_obj_t *botao(lv_obj_t *pai, const char *txt, lv_event_cb_t cb, uint32_t cor);
+static void capa_confirma(lv_event_t *e);
+static void capa_volta(lv_event_t *e);
+
+static void capa_fecha(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_delete_async(capa);
+    capa = NULL;
+}
+
+static void capa_mostra(const char *titulo, const char *texto)
+{
+    lv_label_set_text(capa_titulo, titulo);
+    lv_label_set_text(capa_texto, texto);
+    /* o botão tocado ainda está no meio do próprio evento: some agora, é apagado depois */
+    for (int i = lv_obj_get_child_count(capa_botoes) - 1; i >= 0; i--) {
+        lv_obj_t *b = lv_obj_get_child(capa_botoes, i);
+        lv_obj_set_hidden(b, true);
+        lv_obj_delete_async(b);
+    }
+    lv_refr_now(NULL);                                    /* aparece antes do comando lento */
+}
+
+static void abre_desligar(lv_event_t *e)
+{
+    (void)e;
+    if (capa) return;
+    capa = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(capa, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_radius(capa, 0, 0);
+    lv_obj_set_style_border_width(capa, 0, 0);
+    lv_obj_set_style_bg_color(capa, lv_color_hex(0x0b0e16), 0);
+    lv_obj_set_style_bg_opa(capa, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(capa, 50, 0);
+    lv_obj_set_flex_flow(capa, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(capa, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(capa, 40, 0);
+    lv_obj_set_scrollable(capa, false);
+
+    capa_titulo = lv_label_create(capa);
+    lv_obj_set_style_text_font(capa_titulo, f48, 0);
+    capa_texto = lv_label_create(capa);
+    lv_obj_set_width(capa_texto, lv_pct(100));
+    lv_label_set_long_mode(capa_texto, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(capa_texto, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(capa_texto, lv_color_hex(0xb8c0d0), 0);
+    capa_botoes = lv_obj_create(capa);
+    lv_obj_set_size(capa_botoes, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(capa_botoes, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(capa_botoes, 0, 0);
+    lv_obj_set_flex_flow(capa_botoes, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(capa_botoes, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_label_set_text(capa_titulo, LV_SYMBOL_POWER "  Desligar?");
+    lv_label_set_text(capa_texto, "A flash interna é salva e desmontada. Depois é só "
+                                  "segurar Power + Home até a tela apagar.");
+    botao(capa_botoes, "Cancelar", capa_fecha, 0x343a4a);
+    botao(capa_botoes, LV_SYMBOL_POWER "  Desligar", capa_confirma, 0xc92a2a);
+}
+
+static void capa_confirma(lv_event_t *e)
+{
+    (void)e;
+    capa_mostra(LV_SYMBOL_REFRESH "  Salvando...", "Gravando o que falta e pondo a flash para dormir.");
+    if (roda("/usr/local/sbin/flash-linux desligar >/tmp/flash.log 2>&1") == 0)
+        capa_mostra(LV_SYMBOL_OK "  Pode desligar",
+                    "Flash salva. Segure Power + Home até a tela apagar (ou entre em DFU).");
+    else
+        capa_mostra(LV_SYMBOL_WARNING "  Erro", "flash-linux desligar falhou (ver /tmp/flash.log).");
+    botao(capa_botoes, LV_SYMBOL_LEFT "  Voltar", capa_volta, 0x3b5bdb);
+}
+
+static void capa_volta(lv_event_t *e)
+{
+    capa_mostra(LV_SYMBOL_REFRESH "  Montando...", "Religando a flash interna.");
+    roda("/usr/local/sbin/flash-linux montar >/tmp/flash.log 2>&1 && echo ok >/tmp/flash-estado");
+    capa_fecha(e);
 }
 
 static lv_obj_t *botao(lv_obj_t *pai, const char *txt, lv_event_cb_t cb, uint32_t cor)
@@ -259,7 +386,7 @@ static void monta_tela(void)
     lv_obj_align(l_data, LV_ALIGN_TOP_MID, 0, 260);
 
     lv_obj_t *grade = lv_obj_create(tela);                /* cartões */
-    lv_obj_set_size(grade, lv_pct(100), 780);
+    lv_obj_set_size(grade, lv_pct(100), 1000);
     lv_obj_align(grade, LV_ALIGN_TOP_MID, 0, 330);
     lv_obj_set_style_bg_opa(grade, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(grade, 0, 0);
@@ -272,6 +399,8 @@ static void monta_tela(void)
     cartao(grade, LV_SYMBOL_WARNING, "Temperatura", &v_temp, &d_temp);
     cartao(grade, LV_SYMBOL_SETTINGS, "Memória", &v_sis, &d_sis);
     cartao(grade, LV_SYMBOL_USB, "Carregador", &v_usb, &d_usb);
+    lv_obj_set_width(cartao(grade, LV_SYMBOL_SD_CARD, "Flash interna", &v_flash, &d_flash),
+                     lv_pct(100));
 
     lv_obj_t *l = lv_label_create(grade);                 /* brilho */
     lv_label_set_text(l, LV_SYMBOL_IMAGE "  Brilho");
@@ -284,8 +413,9 @@ static void monta_tela(void)
     lv_slider_set_value(slider, le_num(BRILHO "brightness", 1500) * 100 / brilho_max, LV_ANIM_OFF);
     lv_obj_add_event_cb(slider, ao_mudar_brilho, LV_EVENT_VALUE_CHANGED, NULL);
 
-    botao(grade, LV_SYMBOL_BELL "  Vibrar", vibrar, 0x3b5bdb);
-    botao(grade, LV_SYMBOL_EDIT "  Desenho", abre_desenho, 0x0ca678);
+    lv_obj_set_width(botao(grade, LV_SYMBOL_BELL "  Vibrar", vibrar, 0x3b5bdb), lv_pct(31));
+    lv_obj_set_width(botao(grade, LV_SYMBOL_EDIT "  Desenho", abre_desenho, 0x0ca678), lv_pct(31));
+    lv_obj_set_width(botao(grade, LV_SYMBOL_POWER "  Desligar", abre_desligar, 0xc92a2a), lv_pct(31));
 }
 
 /* ---------- botões físicos ---------- */

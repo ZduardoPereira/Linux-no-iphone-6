@@ -11,10 +11,10 @@ sem cache) e não vê as escritas do ANS; acessos Device passam por fora dele.
 
 diff --git b/drivers/block/apple-ans1.c b/drivers/block/apple-ans1.c
 new file mode 100644
-index 0000000..8d4f27b
+index 0000000..9c6a29e
 --- /dev/null
 +++ b/drivers/block/apple-ans1.c
-@@ -0,0 +1,816 @@
+@@ -0,0 +1,1114 @@
 +// SPDX-License-Identifier: GPL-2.0-only OR MIT
 +/*
 + * Armazenamento interno dos Apple A7/A8 ("ANS1"/ASP) como disco de blocos.
@@ -38,6 +38,11 @@ index 0000000..8d4f27b
 +#include <linux/blk-mq.h>
 +#include <linux/blkdev.h>
 +#include <linux/delay.h>
++#include <linux/ctype.h>
++#include <linux/unaligned.h>
++#include <linux/firmware.h>
++#include <linux/ktime.h>
++#include <linux/dma-mapping.h>
 +#include <linux/highmem.h>
 +#include <linux/io.h>
 +#include <linux/module.h>
@@ -86,6 +91,23 @@ index 0000000..8d4f27b
 +#define ANS1_OP_READ		0x10	/* "UserArea" = o disco principal */
 +#define ANS1_OP_WRITE		0x11
 +#define ANS1_OP_WRITE_UNLOCK	0x19
++/*
++ * 0x1b = abre o armazenamento para E/S (achado no iBoot 4513.270.14: antes da
++ * primeira leitura/escrita, o driver ASP dele refaz os buffers, manda a
++ * configuração de energia e este comando). Com o firmware limpo, sem ele a
++ * primeira leitura derruba o ANS ("L2V_Search.c:78 assert failed").
++ */
++#define ANS1_OP_ABRE_IO		0x1b
++/*
++ * 0x14 = desligamento FINAL / grava o contexto (achado no firmware ANS1-710.260.6:
++ * o analisador de comandos traduz o opcode 0x14 para o tipo interno 0x17, cujo
++ * tratamento chama a mesma rotina de desligamento que Cmd_HandleNvmeShutdown, a
++ * que contém "Bad shutdown"). Sem isso o firmware abandona as áreas abertas no
++ * próximo boot ("Push abandoning non-blank band ... uncleanReboot"). Medido: é como o
++ * shutdown do NVMe; continuar usando o ANS depois dele faz tudo sumir no boot
++ * seguinte. NÃO serve como flush.
++ */
++#define ANS1_OP_SHUTDOWN	0x14
 +#define ANS1_OP_INIT_R		0x72	/* o iBoot manda depois do identify */
 +#define ANS1_OP_POWER_CONFIG	0x80
 +#define ANS1_FLAG_NO_ENCRYPTION	BIT(3)	/* sem isso o AES em linha embaralha os dados */
@@ -111,9 +133,19 @@ index 0000000..8d4f27b
 +module_param(ntags, uint, 0444);
 +MODULE_PARM_DESC(ntags, "comandos simultâneos no ANS (1..16)");
 +
-+static bool escrita;
-+module_param(escrita, bool, 0444);
-+MODULE_PARM_DESC(escrita, "permite ESCREVER na flash (padrão: só leitura)");
++/*
++ * Escrita só dentro de uma JANELA de blocos do disco (LBAs de 4 KB, [de, ate)).
++ * Fora dela, erro, mesmo que um programa erre o endereço: o iOS continua na flash
++ * (o iBoot lê dele o kernel, o DeviceTree e o firmware do SEP, e o nosso boot pelo
++ * checkra1n depende disso). A janela deve ficar no espaço livre do APFS
++ * (host/apfs_livre.py). Sem janela, o disco é só leitura.
++ */
++static ulong escrita_de, escrita_ate;
++module_param(escrita_de, ulong, 0444);
++MODULE_PARM_DESC(escrita_de, "primeiro bloco (LBA de 4 KB do disco) onde é permitido escrever");
++module_param(escrita_ate, ulong, 0444);
++MODULE_PARM_DESC(escrita_ate, "fim (exclusivo) da janela de escrita; 0 = só leitura");
++#define escrita (escrita_ate > escrita_de)
 +
 +/*
 + * O MEMCACHE (cache do lado da memória do A8) E O DMA DO ANS
@@ -217,6 +249,51 @@ index 0000000..8d4f27b
 +	}
 +}
 +
++/*
++ * Firmware LIMPO do ANS (extraído do iBoot do iOS 12.5.7 por scripts/11-firmware-ans.sh).
++ * A cópia que o iBoot deixa na RAM já foi usada (o __DATA mudou e terminou num
++ * "dormir"); dar a partida nela faz o firmware entrar em recuperação a cada sessão
++ * (Push_AbortSkip) e, se a sessão termina sem o "dormir", o boot seguinte descarta
++ * o log de contexto e volta no tempo. Antes de cada partida a frio, recarregamos a
++ * imagem original, como o iBoot faz a cada boot.
++ */
++#define ANS1_FW_NOME		"apple/ans1-n61.bin"
++static bool fw_limpo = true;
++module_param(fw_limpo, bool, 0444);
++MODULE_PARM_DESC(fw_limpo, "recarrega o firmware original do ANS antes de cada partida (padrão: sim)");
++
++#define ANS1_DATA		0x4a000	/* início do __DATA na região do firmware */
++#define ANS1_TAB_MAX		0x200
++
++/* tamanho da tabela de parâmetros (etiqueta de 4 letras, tamanho, valor; ...) */
++static size_t ans1_tabela_tam(const u8 *t, size_t max)
++{
++	size_t p = 0;
++
++	while (p + 8 <= max) {
++		u32 n = get_unaligned_le32(t + p + 4);
++
++		for (int i = 0; i < 4; i++)
++			if (!isalnum(t[p + i]) && t[p + i] != '_')
++				return p;
++		if (n > 0x100 || p + 8 + n > max)
++			return p;
++		p += 8 + n;
++	}
++	return p;
++}
++
++/*
++ * Cochilo: sem pedidos por este tempo, o ANS dorme de forma limpa (salva o contexto
++ * do FTL) e a CPU dele para; o próximo pedido religa (~1 s). Medido: a flash só
++ * sobrevive a um corte de energia DE VERDADE (DFU, bateria) se o ANS estava
++ * dormindo; com ele acordado, o boot seguinte volta para um estado bem antigo (o
++ * chip NAND perde o que guardava). No corte simulado (chip com energia) não perde.
++ */
++static unsigned int cochilo_ms = 2000;
++module_param(cochilo_ms, uint, 0644);
++MODULE_PARM_DESC(cochilo_ms, "ms sem uso até o ANS dormir (0 = nunca)");
++
 +static bool depura;
 +module_param(depura, bool, 0644);
 +MODULE_PARM_DESC(depura, "registra cada comando e o começo dos dados lidos");
@@ -249,6 +326,13 @@ index 0000000..8d4f27b
 +	struct blk_mq_tag_set tagset;
 +	struct gendisk *disk;
 +	bool morto;			/* o firmware travou: tudo falha até recarregar */
++	struct mutex estado;		/* dormindo / acordar / dormir */
++	bool dormindo;			/* contexto salvo, CPU parada: seguro desligar */
++	bool saindo;
++	struct delayed_work cochilo;
++	unsigned int acordou, dormiu;	/* contadores (sysfs não; só para o log) */
++	const u8 *fw;			/* firmware limpo (__TEXT + __DATA inicial), ou NULL */
++	size_t fw_tam;
 +	u64 nr_lba;
 +	u32 lba_size;
 +};
@@ -410,6 +494,102 @@ index 0000000..8d4f27b
 +}
 +
 +/* ---------- caminho de E/S (blk-mq) ---------- */
++
++static int ans1_boot(struct ans1 *ans, bool silencioso);
++static void ans1_dorme(struct ans1 *ans);
++static void ans1_cpu_stop(struct ans1 *ans);
++static void ans1_init_iboot(struct ans1 *ans);
++static int ans1_sync(struct ans1 *ans, u8 op, u16 flags, const struct ans1_campo *campos, int n);
++
++/*
++ * Depois de cada partida (carga do driver ou flush): o que o iBoot manda antes da
++ * primeira E/S, e a liberação da escrita. O firmware parte trancado: sem o 0x19,
++ * a primeira escrita derruba o ANS ("host_ios.c:171", sinalizador de escrita).
++ */
++static int ans1_configura(struct ans1 *ans)
++{
++	int ret;
++
++	if (init_iboot)
++		ans1_init_iboot(ans);
++	ret = ans1_sync(ans, ANS1_OP_ABRE_IO, 0, NULL, 0);
++	if (ret)
++		return ret;
++	if (escrita_ate > escrita_de)
++		ret = ans1_sync(ans, ANS1_OP_WRITE_UNLOCK, 0, NULL, 0);
++	return ret;
++}
++
++/* com ans->estado: põe para dormir (salva o contexto do FTL) */
++static int ans1_adormece(struct ans1 *ans)
++{
++	ktime_t t0 = ktime_get();
++	int ret;
++
++	if (ans->dormindo || READ_ONCE(ans->morto))
++		return READ_ONCE(ans->morto) ? -EIO : 0;
++	ret = apple_rtkit_shutdown(ans->rtk);
++	if (ret) {
++		WRITE_ONCE(ans->morto, true);
++		dev_err(ans->dev, "o ANS não confirmou que dormiu (%d): dados recentes em risco\n", ret);
++		return ret;
++	}
++	ans1_cpu_stop(ans);
++	ans->dormindo = true;
++	ans->dormiu++;
++	if (depura)
++		dev_info(ans->dev, "dormiu em %lld ms\n", ktime_ms_delta(ktime_get(), t0));
++	return 0;
++}
++
++/* com ans->estado: firmware limpo, partida, buffers, configuração */
++static int ans1_acorda(struct ans1 *ans)
++{
++	ktime_t t0 = ktime_get();
++	int ret;
++
++	if (!ans->dormindo)
++		return 0;
++	if (READ_ONCE(ans->morto))
++		return -EIO;
++	ret = ans1_boot(ans, true);
++	if (!ret)
++		ret = ans1_configura(ans);
++	if (ret) {
++		WRITE_ONCE(ans->morto, true);
++		dev_err(ans->dev, "o ANS não acordou (%d)\n", ret);
++		return ret;
++	}
++	ans->dormindo = false;
++	ans->acordou++;
++	if (depura)
++		dev_info(ans->dev, "acordou em %lld ms\n", ktime_ms_delta(ktime_get(), t0));
++	return 0;
++}
++
++/* sem pedidos há cochilo_ms: espera os que estão em andamento e dorme */
++static void ans1_cochilo(struct work_struct *w)
++{
++	struct ans1 *ans = container_of(to_delayed_work(w), struct ans1, cochilo);
++	unsigned int memflags;
++
++	if (READ_ONCE(ans->saindo) || !ans->disk)
++		return;
++	memflags = blk_mq_freeze_queue(ans->disk->queue);
++	mutex_lock(&ans->estado);
++	ans1_adormece(ans);
++	mutex_unlock(&ans->estado);
++	blk_mq_unfreeze_queue(ans->disk->queue, memflags);
++}
++
++static void ans1_agenda_cochilo(struct ans1 *ans)
++{
++	unsigned int ms = READ_ONCE(cochilo_ms);
++
++	if (ms && !READ_ONCE(ans->saindo))
++		mod_delayed_work(system_wq, &ans->cochilo, msecs_to_jiffies(ms));
++}
++
 +static void *ans1_bounce(struct ans1 *ans, unsigned int tag)
 +{
 +	return ans->bounce.v + (size_t)tag * ANS1_MAX_PAGES * ANS1_PAGE;
@@ -429,19 +609,45 @@ index 0000000..8d4f27b
 +	if (READ_ONCE(ans->morto))
 +		return BLK_STS_IOERR;
 +
++	if (req_op(rq) == REQ_OP_FLUSH) {
++		/*
++		 * O ANS só grava o contexto do FTL quando dorme de forma limpa (medido:
++		 * dado salvo assim sobrevive a corte de energia). Flush = dormir; o
++		 * próximo pedido religa.
++		 */
++		int ret;
++
++		blk_mq_start_request(rq);
++		mutex_lock(&ans->estado);
++		ret = ans1_adormece(ans);
++		mutex_unlock(&ans->estado);
++		blk_mq_end_request(rq, ret ? BLK_STS_IOERR : BLK_STS_OK);
++		return BLK_STS_OK;
++	}
++
++	mutex_lock(&ans->estado);
++	if (ans1_acorda(ans)) {
++		mutex_unlock(&ans->estado);
++		return BLK_STS_IOERR;
++	}
++	mutex_unlock(&ans->estado);
++
 +	switch (req_op(rq)) {
 +	case REQ_OP_READ:
 +		op = ANS1_OP_READ;
 +		break;
-+	case REQ_OP_WRITE:
-+		if (!escrita)
++	case REQ_OP_WRITE: {
++		u64 ini = blk_rq_pos(rq) >> 3, fim = ini + npag;
++
++		if (!escrita || ini < escrita_de || fim > escrita_ate) {
++			dev_err_ratelimited(ans->dev,
++					    "escrita RECUSADA nos blocos %llu..%llu (janela %lu..%lu)\n",
++					    ini, fim, escrita_de, escrita_ate);
 +			return BLK_STS_IOERR;
++		}
 +		op = ANS1_OP_WRITE;
 +		break;
-+	case REQ_OP_FLUSH:	/* não anunciamos cache de escrita; nada a fazer */
-+		blk_mq_start_request(rq);
-+		blk_mq_end_request(rq, BLK_STS_OK);
-+		return BLK_STS_OK;
++	}
 +	default:
 +		return BLK_STS_NOTSUPP;
 +	}
@@ -463,6 +669,14 @@ index 0000000..8d4f27b
 +			d += bv.bv_len;
 +		}
 +	}
++
++	/*
++	 * Bloco nunca escrito (ou apagado por TRIM): o ANS responde OK sem escrever
++	 * nada (ans1.py: "trimmed request appears to be SUCCESS so must zero
++	 * beforehand"). Sem zerar, a leitura devolveria o resto do pedido anterior.
++	 */
++	if (op == ANS1_OP_READ)
++		memset_io((void __iomem *)ans1_bounce(ans, rq->tag), 0, bytes);
 +
 +	memset_io((void __iomem *)cmd, 0, ANS1_CMD_SIZE);
 +	for (i = 0; i < npag; i++)
@@ -513,6 +727,7 @@ index 0000000..8d4f27b
 +				 (u8 *)ans1_bounce(ans, rq->tag));
 +	}
 +	blk_mq_end_request(rq, arq->status);
++	ans1_agenda_cochilo(ans);
 +}
 +
 +static enum blk_eh_timer_return ans1_timeout(struct request *rq)
@@ -604,46 +819,14 @@ index 0000000..8d4f27b
 +	dev_info(ans->dev, "ANS dormindo, CPU parada\n");
 +}
 +
-+static int ans1_boot(struct ans1 *ans)
++/* acorda o ANS pelo RTKit e entrega o buffer de comandos (depois da partida ou do sono) */
++static int ans1_conecta(struct ans1 *ans)
 +{
-+	u64 phys, iova, size;
 +	int ret;
 +
-+	ret = ans1_fw_region(ans, &phys, &iova, &size);
-+	if (ret)
-+		return dev_err_probe(ans->dev, ret,
-+				     "sem o firmware do ANS (o m1n1 passa ele pelo alias 'asp')\n");
-+	dev_info(ans->dev, "firmware do iBoot em %#llx (%#llx bytes)\n", phys, size);
-+
-+	writel(lower_32_bits(iova), ans->cpu + AKF_REMAP_IOVA_LO);
-+	writel(upper_32_bits(iova), ans->cpu + AKF_REMAP_IOVA_HI);
-+	writel(lower_32_bits(phys), ans->cpu + AKF_REMAP_PHYS_LO);
-+	writel(upper_32_bits(phys), ans->cpu + AKF_REMAP_PHYS_HI);
-+	writel(lower_32_bits(size), ans->cpu + AKF_REMAP_SIZE_LO);
-+	writel(upper_32_bits(size), ans->cpu + AKF_REMAP_SIZE_HI);
-+	writel(1, ans->cpu + AKF_ENDIANNESS);
-+	writel(0, ans->cpu + AKF_UNK_80C);
-+
-+	/*
-+	 * Ciclo do m1n1 (e do iBoot): dormir (AP quieto + IOP dormindo, com
-+	 * confirmação) e SÓ ENTÃO parar a CPU; daí a partida funciona. Parar a CPU
-+	 * no meio do uso deixa o __DATA do firmware inconsistente e ele trava
-+	 * ("anc_queue.c:62 assert failed: Queue underflow"). O iBoot e o nosso
-+	 * remove() deixam a CPU parada; se ela está rodando, alguém a deixou ligada.
-+	 */
-+	if (readl(ans->cpu + AKF_CPU_CONTROL) & AKF_CPU_CONTROL_START) {
-+		dev_info(ans->dev, "a CPU do ANS já está rodando: pondo para dormir antes\n");
-+		ret = apple_rtkit_shutdown(ans->rtk);
-+		if (ret)
-+			dev_warn(ans->dev, "o ANS não confirmou que dormiu (%d); tentando assim mesmo\n",
-+				 ret);
-+		ans1_cpu_stop(ans);
-+	}
-+	writel(readl(ans->cpu + AKF_CPU_CONTROL) | AKF_CPU_CONTROL_START,
-+	       ans->cpu + AKF_CPU_CONTROL);
-+
-+	/* como o m1n1: logo depois da partida, "acorde" (INIT); ele responde HELLO */
++	/* "acorde" (INIT): ele responde HELLO; vale para partida a frio e para sono */
 +	reinit_completion(&ans->ready);
++	reinit_completion(&ans->cmdbuf_ready);
 +	ret = apple_rtkit_wake(ans->rtk);
 +	if (ret) {
 +		ans1_diag(ans, "falhou");
@@ -672,7 +855,78 @@ index 0000000..8d4f27b
 +		if (ret)
 +			return ret;
 +	}
-+	dev_info(ans->dev, "ANS pronto (endpoint %u, %u tag(s))\n", ans->ep, ntags);
++	return 0;
++}
++
++static int ans1_boot(struct ans1 *ans, bool silencioso)
++{
++	u64 phys, iova, size;
++	int ret;
++
++	ret = ans1_fw_region(ans, &phys, &iova, &size);
++	if (ret)
++		return dev_err_probe(ans->dev, ret,
++				     "sem o firmware do ANS (o m1n1 passa ele pelo alias 'asp')\n");
++	if (!silencioso)
++		dev_info(ans->dev, "firmware do iBoot em %#llx (%#llx bytes)\n", phys, size);
++
++	writel(lower_32_bits(iova), ans->cpu + AKF_REMAP_IOVA_LO);
++	writel(upper_32_bits(iova), ans->cpu + AKF_REMAP_IOVA_HI);
++	writel(lower_32_bits(phys), ans->cpu + AKF_REMAP_PHYS_LO);
++	writel(upper_32_bits(phys), ans->cpu + AKF_REMAP_PHYS_HI);
++	writel(lower_32_bits(size), ans->cpu + AKF_REMAP_SIZE_LO);
++	writel(upper_32_bits(size), ans->cpu + AKF_REMAP_SIZE_HI);
++	writel(1, ans->cpu + AKF_ENDIANNESS);
++	writel(0, ans->cpu + AKF_UNK_80C);
++
++	/*
++	 * Ciclo do m1n1 (e do iBoot): dormir (AP quieto + IOP dormindo, com
++	 * confirmação) e SÓ ENTÃO parar a CPU; daí a partida funciona. Parar a CPU
++	 * no meio do uso deixa o __DATA do firmware inconsistente e ele trava
++	 * ("anc_queue.c:62 assert failed: Queue underflow"). O iBoot e o nosso
++	 * remove() deixam a CPU parada; se ela está rodando, alguém a deixou ligada.
++	 */
++	if (readl(ans->cpu + AKF_CPU_CONTROL) & AKF_CPU_CONTROL_START) {
++		if (!silencioso)
++			dev_info(ans->dev, "a CPU do ANS já está rodando: pondo para dormir antes\n");
++		ret = apple_rtkit_shutdown(ans->rtk);
++		if (ret)
++			dev_warn(ans->dev, "o ANS não confirmou que dormiu (%d); tentando assim mesmo\n",
++				 ret);
++		ans1_cpu_stop(ans);
++		msleep(50);
++	}
++	if (ans->fw) {
++		/*
++		 * Imagem original: __TEXT + __DATA inicial, o resto da região zerado. O
++		 * começo do __DATA é uma tabela de parâmetros que o iBoot preenche (SOC_,
++		 * SOCR, McRA, ANCC = clock do barramento da flash, RHB0/RHS0 = área de
++		 * trabalho...): sem ela o firmware trava ("anc_link_clk_hz != 0"). Então a
++		 * tabela da cópia atual é preservada.
++		 */
++		void __iomem *r = ioremap(phys, size);
++		u8 tab[ANS1_TAB_MAX];
++		size_t ntab;
++
++		if (!r)
++			return dev_err_probe(ans->dev, -ENOMEM, "não mapeei a região do firmware\n");
++		memcpy_fromio(tab, r + ANS1_DATA, sizeof(tab));
++		ntab = ans1_tabela_tam(tab, sizeof(tab));
++		memcpy_toio(r, ans->fw, ans->fw_tam);
++		memset_io(r + ans->fw_tam, 0, size - ans->fw_tam);
++		memcpy_toio(r + ANS1_DATA, tab, ntab);
++		iounmap(r);
++		if (!silencioso)
++			dev_info(ans->dev, "firmware limpo recarregado (%zu bytes)\n", ans->fw_tam);
++	}
++	writel(readl(ans->cpu + AKF_CPU_CONTROL) | AKF_CPU_CONTROL_START,
++	       ans->cpu + AKF_CPU_CONTROL);
++
++	ret = ans1_conecta(ans);
++	if (ret)
++		return ret;
++	if (!silencioso)
++		dev_info(ans->dev, "ANS pronto (endpoint %u, %u tag(s))\n", ans->ep, ntags);
 +	return 0;
 +}
 +
@@ -712,6 +966,8 @@ index 0000000..8d4f27b
 +		.io_min = ANS1_PAGE,
 +		.max_hw_sectors = ANS1_MAX_PAGES * (ANS1_PAGE >> SECTOR_SHIFT),
 +		.max_segments = ANS1_MAX_PAGES,
++		/* o ANS só garante o que foi escrito depois de dormir: o Linux manda flush */
++		.features = BLK_FEAT_WRITE_CACHE,
 +	};
 +	struct ans1 *ans;
 +	int ret;
@@ -727,6 +983,16 @@ index 0000000..8d4f27b
 +	init_completion(&ans->ready);
 +	init_completion(&ans->cmdbuf_ready);
 +	init_completion(&ans->sync_done);
++	mutex_init(&ans->estado);
++	INIT_DELAYED_WORK(&ans->cochilo, ans1_cochilo);
++
++	/*
++	 * O RTKit aloca os buffers de log/crashlog do ANS pela API de DMA; sem isto a
++	 * máscara padrão (32 bits) não alcança a RAM do A8 (que começa em 0x8_0000_0000).
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(44));
++	if (ret)
++		return ret;
 +
 +	ans->cpu = devm_platform_ioremap_resource(pdev, 0);
 +	if (IS_ERR(ans->cpu))
@@ -744,11 +1010,30 @@ index 0000000..8d4f27b
 +		return dev_err_probe(dev, ret, "sem memória para os buffers do ANS\n");
 +	ans1_varre();
 +
++	if (fw_limpo) {
++		const struct firmware *f;
++
++		if (!request_firmware(&f, ANS1_FW_NOME, dev)) {
++			if (f->size > 0x4a000 && f->size < SZ_1M) {
++				ans->fw = devm_kmemdup(dev, f->data, f->size, GFP_KERNEL);
++				ans->fw_tam = f->size;
++			}
++			release_firmware(f);
++		}
++		if (!ans->fw)
++			dev_warn(dev, "sem %s: usando a cópia do iBoot (escrita pouco confiável)\n",
++				 ANS1_FW_NOME);
++	}
++	if (!ans->fw && escrita_ate > escrita_de) {
++		dev_warn(dev, "sem o firmware limpo a escrita não é segura: disco só leitura\n");
++		escrita_ate = escrita_de;
++	}
++
 +	ans->rtk = devm_apple_rtkit_init(dev, ans, NULL, 0, &ans1_rtkit_ops);
 +	if (IS_ERR(ans->rtk))
 +		return dev_err_probe(dev, PTR_ERR(ans->rtk), "RTKit/mailbox\n");
 +
-+	ret = ans1_boot(ans);
++	ret = ans1_boot(ans, false);
 +	if (ret) {
 +		/* não deixa o ANS ligado e escrevendo log em buffers que vão ser liberados */
 +		if (apple_rtkit_is_running(ans->rtk))
@@ -758,10 +1043,11 @@ index 0000000..8d4f27b
 +	ret = ans1_identify(ans);
 +	if (ret)
 +		goto desliga;
-+	if (init_iboot)
-+		ans1_init_iboot(ans);
-+	if (escrita && ans1_sync(ans, ANS1_OP_WRITE_UNLOCK, 0, NULL, 0))
-+		dev_warn(dev, "WRITE_UNLOCK recusado\n");
++	ret = ans1_configura(ans);
++	if (ret) {
++		dev_err(dev, "configuração depois da partida falhou: %d\n", ret);
++		goto desliga;
++	}
 +
 +	ans->tagset.ops = &ans1_mq_ops;
 +	ans->tagset.nr_hw_queues = 1;
@@ -770,6 +1056,7 @@ index 0000000..8d4f27b
 +	ans->tagset.cmd_size = sizeof(struct ans1_rq);
 +	ans->tagset.timeout = ANS1_TIMEOUT;
 +	ans->tagset.driver_data = ans;
++	ans->tagset.flags = BLK_MQ_F_BLOCKING;	/* o flush espera o ANS reiniciar */
 +	ret = blk_mq_alloc_tag_set(&ans->tagset);
 +	if (ret)
 +		goto desliga;
@@ -790,7 +1077,13 @@ index 0000000..8d4f27b
 +	ret = add_disk(ans->disk);
 +	if (ret)
 +		goto disco;
-+	dev_info(dev, "disco ans0 pronto (%s)\n", escrita ? "LEITURA E ESCRITA" : "só leitura");
++	if (escrita)
++		dev_info(dev, "disco ans0 pronto: escrita SÓ nos blocos %lu..%lu (%lu MB), "
++			 "cochilo %u ms\n", escrita_de, escrita_ate, (escrita_ate - escrita_de) >> 8,
++			 cochilo_ms);
++	else
++		dev_info(dev, "disco ans0 pronto (só leitura)\n");
++	ans1_agenda_cochilo(ans);
 +	return 0;
 +
 +disco:
@@ -807,10 +1100,15 @@ index 0000000..8d4f27b
 +{
 +	struct ans1 *ans = platform_get_drvdata(pdev);
 +
-+	del_gendisk(ans->disk);
++	WRITE_ONCE(ans->saindo, true);
++	cancel_delayed_work_sync(&ans->cochilo);
++	del_gendisk(ans->disk);			/* manda o último flush (ANS dorme) */
 +	put_disk(ans->disk);
 +	blk_mq_free_tag_set(&ans->tagset);
-+	ans1_dorme(ans);
++	if (!ans->dormindo)
++		ans1_dorme(ans);
++	dev_info(ans->dev, "ANS dormindo, CPU parada (acordou %u vezes, dormiu %u)\n",
++		 ans->acordou, ans->dormiu);
 +}
 +
 +static const struct of_device_id ans1_of_match[] = {

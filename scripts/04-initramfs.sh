@@ -38,6 +38,12 @@ else
   echo "aviso: sem firmware do touch (rode ./scripts/09-firmware-touch.sh)"
 fi
 
+if [ -s "$BUILD/firmware/apple-ans1-n61.bin" ]; then      # é da Apple: fica só no build/
+  install -D -m 644 "$BUILD/firmware/apple-ans1-n61.bin" "$WORK/lib/firmware/apple/ans1-n61.bin"
+else
+  echo "aviso: sem firmware limpo do ANS (rode ./scripts/11-firmware-ans.sh)"
+fi
+
 log "Módulos do kernel (.ko) -> /lib/modules"
 if [ -d "$(dirname "$KSRC")/modules/lib/modules" ]; then
   mkdir -p "$WORK/lib/modules"

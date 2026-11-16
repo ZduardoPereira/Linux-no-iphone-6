@@ -1,0 +1,46 @@
+m1n1: mostra o estado do ANS (flash) no início e antes do Linux
+
+Só leitura: PMGR ps_ans e, se ligado, CPU_CONTROL e filas do mailbox. Para
+descobrir quem para a CPU do ANS entre o iBoot e o Linux.
+
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -533,4 +533,17 @@
+ bool main_storage_read(u64 lba, u64 *bfr);
+ void main_storage_shutdown(void);
+ bool main_storage_flush(void);
++/* Linux-no-iphone-6: estado do coprocessador da flash (ANS) do A8, só leitura */
++static inline void ans_estado(const char *onde)
++{
++    u32 ps = read32(0x20e020318); /* PMGR ps_ans: bits 7:4 = estado atual */
++    printf("ANS-ESTADO (%s): pmgr=%08x", onde, ps);
++    if (((ps >> 4) & 0xf) == 0xf)
++        printf(" cpu_control=%08x a2i=%08x i2a=%08x", read32(0x208040028), read32(0x208041008),
++               read32(0x208041020));
++    else
++        printf(" (dominio desligado: nao leio o ANS)");
++    printf("\n");
++}
++
+ #endif
+--- a/src/main.c
++++ b/src/main.c
+@@ -147,6 +147,8 @@
+ 
+     printf("Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
+ 
++    ans_estado("inicio do m1n1"); /* Linux-no-iphone-6 */
++
+     firmware_init();
+ 
+     heapblock_init();
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -3068,6 +3068,7 @@
+         asc_free(smc);
+     }
+ 
++    ans_estado("antes do Linux"); /* Linux-no-iphone-6 */
+     printf("Setting SMP mode to WFE...\n");
+     smp_set_wfe_mode(true);
+     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);

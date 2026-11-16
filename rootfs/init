@@ -2,6 +2,9 @@
 # /init — primeiro programa que o kernel executa (PID 1).
 # Se este script terminar, o kernel entra em pânico; por isso o laço no final.
 
+# o kernel dá um PATH mínimo; os nossos programas ficam em /usr/local
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 mount -t devtmpfs devtmpfs /dev
 exec </dev/console >/dev/console 2>&1
 mount -t proc     proc     /proc
@@ -39,6 +42,18 @@ dropbear -R -s -E 2>/tmp/dropbear.log && echo "SSH: ./scripts/ssh.sh (root@$(cat
     /usr/local/bin/inicio >/tmp/inicio.log 2>&1
     sleep 2
   done ) &
+
+# Flash interna: monta o ext4 da janela em /mnt/flash, em segundo plano. Não formata
+# nada sozinho. O driver põe o ANS para dormir 2 s depois do último uso, e é isso
+# que deixa desligar sem aviso. Para pular: "semflash" na linha de comando do kernel.
+if ! grep -qw semflash /proc/cmdline; then
+  ( echo "montando..." > /tmp/flash-estado
+    if flash-linux montar > /tmp/flash.log 2>&1; then
+      echo ok > /tmp/flash-estado
+    else
+      echo "erro (ver /tmp/flash.log)" > /tmp/flash-estado
+    fi ) &
+fi
 
 echo "Pronto. No PC: ./scripts/07-conectar.sh"
 echo "IP do iPhone: $(cat /etc/iphone6/phone_ip)"

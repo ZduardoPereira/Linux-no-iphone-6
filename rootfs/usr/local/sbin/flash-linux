@@ -1,0 +1,42 @@
+#!/bin/sh
+# flash-linux — flash interna do iPhone para o Linux (/dev/mapper/linux = a janela).
+#   flash-linux             carrega o driver e cria /dev/mapper/linux
+#   flash-linux montar      ... e monta o ext4 em /mnt/flash
+#   flash-linux formatar    APAGA a janela e cria um ext4 novo (sem montar)
+#   flash-linux desligar    desmonta e põe o ANS para dormir (faça antes do DFU)
+# A janela vem de /etc/modprobe.d/apple-ans1.conf (blocos de 4 KB do disco).
+#
+# Durabilidade: a flash só aguenta um corte de energia de verdade (DFU, bateria) se
+# o ANS estiver DORMINDO. O driver o põe para dormir sozinho depois de 2 s sem uso
+# (parâmetro cochilo_ms) e a cada sync/fsync. Desligar no meio de uma gravação
+# pode fazer o boot seguinte voltar para um estado antigo.
+set -e
+if [ "$1" = desligar ]; then
+    sync
+    umount /mnt/flash 2>/dev/null || true
+    dmsetup remove linux 2>/dev/null || true
+    rmmod apple_ans1 2>/dev/null || true
+    echo "flash-linux: flash salva e ANS dormindo; pode desligar/reiniciar"
+    exit 0
+fi
+modprobe apple-ans1
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/ans0 ] && break; sleep 0.5; done
+[ -b /dev/ans0 ] || { echo "flash-linux: /dev/ans0 não apareceu (dmesg | grep ans1)"; exit 1; }
+de=$(cat /sys/module/apple_ans1/parameters/escrita_de)
+ate=$(cat /sys/module/apple_ans1/parameters/escrita_ate)
+[ "$ate" -gt "$de" ] || { echo "flash-linux: sem janela de escrita"; exit 1; }
+# dm-linear em setores de 512 bytes: início e tamanho da janela
+[ -b /dev/mapper/linux ] || dmsetup create linux --table "0 $(( (ate - de) * 8 )) linear /dev/ans0 $(( de * 8 ))"
+echo "flash-linux: /dev/mapper/linux = $(( (ate - de) / 256 )) MB (blocos $de..$ate)"
+if [ "$1" = formatar ]; then
+    # tabelas de inodes e journal escritos agora (~20 s), e não aos poucos depois
+    # do mount (o ext4lazyinit manteria o ANS acordado por muito tempo)
+    mkfs.ext4 -F -q -L linux -E lazy_itable_init=0,lazy_journal_init=0 /dev/mapper/linux
+    sync
+    echo "flash-linux: ext4 criado"
+fi
+if [ "$1" = montar ]; then
+    mkdir -p /mnt/flash
+    # commit=30: cada salvamento (flush) custa ~1 s ao ANS
+    mount -t ext4 -o commit=30 /dev/mapper/linux /mnt/flash && echo "flash-linux: montado em /mnt/flash"
+fi
