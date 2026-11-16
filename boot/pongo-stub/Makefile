@@ -2,7 +2,8 @@
 # alinhado a 4 KB (só usa endereçamento relativo ao PC: adr/adrp).
 CC      := clang --target=aarch64-none-elf
 CFLAGS  := -O2 -ffreestanding -fno-builtin -nostdlib -fno-pic -fno-stack-protector \
-           -mgeneral-regs-only -mstrict-align -Wall -Wextra
+           -mgeneral-regs-only -mstrict-align -Wall -Wextra \
+           $(if $(STUB_SEM_EL3),-DSTUB_SEM_EL3)
 OUT     ?= .
 
 $(OUT)/pongo-stub.bin: start.S stub.c stub.ld

@@ -1,0 +1,59 @@
+m1n1: smp: núcleo secundário segue o modo de segurança da CPU de boot
+
+Com o stub do pongoOS antigo subindo para EL3 ("smc #0", como o bootm do pongoOS
+novo), a CPU de boot chega ao m1n1 em EL3 e desce para EL1 NÃO-SEGURO, como o iOS.
+Aí os caches da CPU passam a ser coerentes com o DMA dos dispositivos (ANS, DART do
+PCIe), que acessam a memória como não-seguros. O patch 0003 deixava o secundário
+sempre seguro (para combinar com a CPU 0 em EL1 seguro do bootr); agora ele lê
+boot_cpu_ns: CPU de boot em EL3 -> secundário não-seguro; senão -> seguro.
+
+--- a/src/start.S
++++ b/src/start.S
+@@ -115,6 +115,16 @@
+     msr tpidr_el3, xzr
+     adrp x6, _stack_bot
+     adr x7, _start_c
++    /*
++     * Linux-no-iphone-6: a CPU de boot chegou em EL3 (o stub do pongoOS antigo sobe
++     * para EL3 com "smc #0", como o "bootm" do pongoOS novo): desce para EL1 NÃO-SEGURO,
++     * como o iOS, e anota isso para os núcleos secundários seguirem o mesmo modo.
++     * MMU desligada aqui: a anotação vai direto para a RAM.
++     */
++    adrp x8, boot_cpu_ns
++    mov w9, #1
++    str w9, [x8, :lo12:boot_cpu_ns]
++    dsb sy
+     mov x13, xzr        // CPU de boot: desce para EL1 não-seguro (comportamento original)
+     b el3_eret_to_el1
+ 
+@@ -187,11 +197,14 @@
+     bl _cpu_reset_c
+     /*
+      * Linux-no-iphone-6: núcleo secundário. Fica no MESMO modo de segurança da CPU de
+-     * boot. No iPhone 6 via pongoOS antigo a CPU 0 já está em EL1 seguro; se a CPU 1
+-     * descer como não-segura, os caches tratam os acessos das duas como endereços
+-     * diferentes e a CPU 1 não enxerga o que a CPU 0 escreveu (ex.: target_cpu).
++     * boot: os caches tratam acessos seguros e não-seguros ao mesmo endereço como
++     * endereços diferentes, e a CPU 1 não enxergaria o que a CPU 0 escreveu (ex.:
++     * target_cpu). CPU de boot em EL3 (boot_cpu_ns = 1): não-seguro (x13 = 0);
++     * CPU de boot que já chegou em EL1 seguro (bootr sem o smc): seguro (x13 = 1).
+      */
+-    mov x13, #1
++    adrp x13, boot_cpu_ns
++    ldr w13, [x13, :lo12:boot_cpu_ns]
++    eor x13, x13, #1
+     adrp x6, _reset_stack_el1
+     add x6, x6, :lo12:_reset_stack_el1
+     ldr x6, [x6]
+@@ -251,3 +264,11 @@
+     b .
+ 
+ .pool
++
++/* Linux-no-iphone-6: 1 = a CPU de boot desceu de EL3 para EL1 não-seguro.
++ * Em .data (não em .bss): é escrita antes de a bss ser zerada. */
++.data
++.balign 4
++.globl boot_cpu_ns
++boot_cpu_ns:
++    .word 0

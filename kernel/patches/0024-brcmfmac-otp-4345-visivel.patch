@@ -1,0 +1,22 @@
+wifi: brcmfmac: mostra a OTP do BCM4345 B1 (módulo/fabricante/versão escolhem a NVRAM)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index fb2e8d6..6f4edc7 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -2139,6 +2139,15 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
+ 	}
+ 
+ 	ret = brcmf_pcie_parse_otp(devinfo, (u8 *)otp, 2 * words);
++	if (optional && !ret)
++		/* iPhone 6: o módulo/fabricante/versão escolhem a NVRAM do iOS */
++		dev_info(&pdev->dev, "OTP: module=%s vendor=%s version=%s (%s)\n",
++			 devinfo->otp.module, devinfo->otp.vendor,
++			 devinfo->otp.version,
++			 devinfo->otp.valid ? "completo" : "incompleto");
++	if (optional && !devinfo->otp.valid)
++		print_hex_dump(KERN_INFO, "brcmfmac OTP: ", DUMP_PREFIX_OFFSET,
++			       16, 2, otp, 2 * words, false);
+ 	if (ret && optional) {
+ 		dev_info(&pdev->dev,
+ 			 "OTP not parsed (%d), using the default firmware names; raw OTP:\n",

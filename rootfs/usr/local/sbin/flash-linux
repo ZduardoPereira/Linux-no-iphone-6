@@ -77,7 +77,7 @@ atualizar)
     raiz_na_flash && { echo "flash-linux: rode só a partir da RAM (o /init faz isso)"; exit 1; }
     # o que vem do PC a cada boot; os pacotes do Alpine (apk add) ficam como estão
     for p in /usr/local /etc/iphone6 /etc/modprobe.d /etc/profile.d /etc/hostname \
-             /lib/modules /lib/firmware/apple /root/.ssh /root/n1.py /root/adt.py; do
+             /lib/modules /lib/firmware/apple /lib/firmware/brcm /root/.ssh /root/n1.py /root/adt.py; do
         [ -e "$p" ] || continue
         mkdir -p "$SISTEMA$(dirname "$p")"
         rm -rf "$SISTEMA$p"

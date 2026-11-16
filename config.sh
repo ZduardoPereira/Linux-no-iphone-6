@@ -24,7 +24,7 @@ PALERA1N_URL="https://github.com/palera1n/palera1n/releases/download/v2.4/palera
 IPSW_URL="https://github.com/blacktop/ipsw/releases/download/v3.1.741/ipsw_3.1.741_linux_x86_64.tar.gz"
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/v3.23"
 # Pacotes que vão dentro do initramfs (o iPhone ainda não tem armazenamento)
-EXTRA_PKGS="dropbear dropbear-scp openssh-sftp-server i2c-tools evtest lm-sensors libgpiod e2fsprogs device-mapper"
+EXTRA_PKGS="dropbear dropbear-scp openssh-sftp-server i2c-tools evtest lm-sensors libgpiod e2fsprogs device-mapper iw wpa_supplicant wireless-regdb"
 ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/alpine-minirootfs-3.23.2-aarch64.tar.gz"
 
 # --- Alvo -------------------------------------------------------------------
@@ -44,6 +44,9 @@ BOOTARGS="$BOOTARGS panic=0"
 # Flash interna (fase 7): o disco do iOS tem GPT sem o "MBR de proteção" no setor 0;
 # sem "gpt" o Linux não reconhece as partições do /dev/ans0
 BOOTARGS="$BOOTARGS gpt"
+# Fase 8 (Wi-Fi): o sistema sobe na RAM e o ANS (flash) nem liga, para um travamento
+# nos testes do PCIe não pegar o ANS acordado. Tirar quando o Wi-Fi estiver pronto.
+BOOTARGS="$BOOTARGS semflash"
 # Rede via USB: o iPhone fica com .1 e o PC com .2
 PHONE_IP="172.16.42.1"
 HOST_IP="172.16.42.2"
@@ -54,3 +57,7 @@ case "$KSRC" in *" "*|*:*) echo "ERRO: KSRC não pode ter espaços ou ':' ($KSRC
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERRO:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Wi-Fi: NVRAM do iOS para o módulo deste aparelho, como o brcmfmac mostra no boot
+# ("OTP: module=CORO vendor=u version=3.7" -> CORO_V-u__m-3.7). Ver scripts/12-firmware-wifi.sh.
+WIFI_NVRAM="CORO_V-u__m-3.7"

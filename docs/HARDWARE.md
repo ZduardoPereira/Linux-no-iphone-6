@@ -34,7 +34,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | `sgx` | GPU PowerVR GX6450 | ❌ sem driver aberto |
 | `isp`, `jpeg`, `ave`, `vxd`, `scaler` | câmera, JPEG, vídeo, escalador | ❌ |
 | `mca0..4` + `i2s-switch` | áudio digital | ❌ |
-| `apcie` | PCIe (onde fica o Wi-Fi) | ❌ m1n1: "pcie: Unsupported compatible" |
+| `apcie` | PCIe (onde fica o Wi-Fi) | ✅ `pcie-apple` com o A8 (fase 8); o m1n1 não precisa |
 | `tempsensor0..4` | sensores de temperatura | ✅ driver nosso `apple-t7000-temp` (patch 0004); `readBK` bits 27..16 = décimos de °C (hipótese) |
 | `dietempctl0`, `amc`, `sochot0/1` | controle térmico / temperatura da RAM | ❌ |
 | `dart-*` | IOMMUs (uma por bloco) | ❌ |
@@ -55,7 +55,7 @@ Legenda: ✅ funciona · ⚠️ parcial · ❌ sem driver/desligado · 🔒 bloq
 | spi2 | `multi-touch,n61` | **touchscreen** (Apple N1/Z2) | ✅ driver nosso `apple-n1` (patches 0009/0010, m1n1 0004) + firmware do iOS; multitoque |
 | spi3 | `biosensor,mesa` | Touch ID | ❌ (não faz sentido) |
 | uart1 | `bluetooth,n88` (BCM4345) | Bluetooth | ✅ `hci_bcm` existe, depende de energia/GPIO + firmware |
-| uart4 + apcie | `wlan-pcie-uart,bcm5345` (BCM4345) | Wi-Fi | ✅ `brcmfmac` existe, depende do PCIe |
+| uart4 + apcie | `wlan-pcie-uart,bcm5345` (BCM4345 B1, módulo USI) | Wi-Fi | ✅ `brcmfmac` + firmware do iOS: busca redes (fase 8) |
 | uart5 | `gas-gauge,bq27540` (TI) | medidor de bateria (HDQ) | ✅ driver nosso `apple-hdq-battery` (patch 0007) + núcleo `bq27xxx`; corrente indisponível ([BQ27540.md](BQ27540.md)) |
 | uart8 | `apple-oscar` | coprocessador de movimento (M8) | ❌ |
 | mipi-dsim | `lcd,pinot` | painel da tela | ❌ |

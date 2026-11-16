@@ -208,6 +208,39 @@ HoolockLinux (m1n1 `src/ans1.c`, `proxyclient/m1n1/fw/ans1.py`).
 - [x] **Nunca** mandar o opcode 0x14 (desligamento NVMe) com uso depois: o boot seguinte
       recusou o log ("DM sequence in CLog didn't match") e a janela se perdeu
 
+## Fase 8: Wi-Fi ← conectado à internet ✅ (16/11/2026)
+O Wi-Fi é um **Broadcom BCM4345 B1** ligado por **PCIe** (`apcie,t7000`) atrás de uma
+IOMMU da Apple (DART `dart-apcie1`). Base: os patches GPL-2.0 de
+[ITSMEFRTRUST/linux-on-iphone6](https://github.com/ITSMEFRTRUST/linux-on-iphone6),
+estudados e adaptados (`kernel/patches/0015`–`0023`, com autoria original).
+
+- [x] GPIO do PMIC (`0015`): `WL_REG_ON` = GPIO 10 do PMU liga o chip (o GPIO 11 fica
+      reservado: mexer nele travou o I2C do PMU no aparelho de referência)
+- [x] Controlador PCIe do A8 (`0017`/`0018`), testado etapa por etapa (`t7000_stage` 1→6):
+      PHY, porta 1, link treinado, chip `14e4:43ab` enumerado
+- [x] DART do apcie (`0022`/`0023`: formato de descritor S5L8960X; janela de DMA
+      0x80000000–0xbfffefff no device tree, `0025`)
+- [x] `brcmfmac` com o BCM4345 B1 (`0020`/`0021`); a OTP do chip diz o módulo
+      (`0024`): neste aparelho **USI** (`module=CORO vendor=u version=3.7`)
+- [x] Firmware tirado do iOS 12.5.7 (`scripts/12-firmware-wifi.sh`: baixa só o sistema de
+      arquivos do IPSW, lê o APFS com o 7-Zip, escolhe a NVRAM pelo `WIFI_NVRAM` do
+      `config.sh` e põe o MAC do ADT)
+- [x] **A descoberta que destravou tudo: o Linux rodava em modo *Secure*.** O pongoOS
+      antigo (`bootr`) entrega a CPU em EL1 *Secure*; o iOS e os dispositivos usam
+      *Non-secure*, e os caches tratam os dois modos como endereços diferentes. A DART
+      lia tabelas sem as entradas recém-gravadas ("NO PTE"). Correção: o stub faz
+      `smc #0` (o monitor de EL3 do próprio pongoOS devolve a CPU em EL3, como no
+      `bootm` do pongoOS novo) e o m1n1 desce para EL1 *Non-secure*; o 2º núcleo segue a
+      CPU de boot (`m1n1/patches/0007`). `STUB_SEM_EL3=1` no stub volta ao modo antigo
+- [x] `iw` + `wpa_supplicant` + `wireless-regdb`; comando `wifi` (ligar, redes,
+      conectar com senha digitada sem aparecer, estado, desligar)
+- [x] Conectar a uma rede (`wifi conectar "Nome"`): internet e DNS pela `wlan0` (sinal
+      −37 dBm, 65 Mbit/s); o `udhcpc` fica em segundo plano renovando o endereço
+- [ ] Ligar o Wi-Fi sozinho no boot e mostrar na tela inicial
+- [ ] Rever, agora em *Non-secure*: o DMA do USB (sem `apple_pio`) e os contornos do
+      memcache no driver da flash (buffers Device)
+- [ ] Tirar o `semflash` do `config.sh` (os testes do PCIe rodaram com a flash desligada)
+
 ## Fase 6: Android
 O Android é um kernel Linux + um userspace próprio (init do Android, Binder, SurfaceFlinger, ART).
 Requisitos e o plano para o iPhone 6:

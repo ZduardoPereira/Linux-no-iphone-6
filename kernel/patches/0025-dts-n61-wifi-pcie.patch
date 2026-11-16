@@ -1,0 +1,179 @@
+arm64: dts: apple: t7000/n61: PCIe, DART do apcie, GPIOs do PMIC e Wi-Fi (BCM4345)
+
+diff --git a/arch/arm64/boot/dts/apple/t7000.dtsi b/arch/arm64/boot/dts/apple/t7000.dtsi
+index 2ebdfaa..a16e4ac 100644
+--- a/arch/arm64/boot/dts/apple/t7000.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000.dtsi
+@@ -335,6 +335,79 @@
+ 					 <APPLE_PINMUX(86, 1)>;
+ 			};
+ 		};
++
++		/*
++		 * PCIe do A8 (ADT /arm-io/apcie, "apcie,t7000"): a porta 1 leva o
++		 * Wi-Fi; a porta 0 é a do NVMe, sem uso no iPhone 6. Baseado no
++		 * trabalho de ITSMEFRTRUST/linux-on-iphone6 (GPL-2.0).
++		 */
++		pcie: pcie@610000000 {
++			compatible = "apple,t7000-pcie";
++			device_type = "pci";
++
++			reg = <0x6 0x10000000 0x0 0x1000000>,
++			      <0x6 0x00000000 0x0 0x2000>,
++			      <0x6 0x01004000 0x0 0x1000>,
++			      <0x6 0x02004000 0x0 0x1000>,
++			      <0x6 0x01005000 0x0 0x1000>;
++			reg-names = "config", "rc", "port0", "port1", "phy0";
++
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 212 IRQ_TYPE_LEVEL_HIGH>,
++				     <AIC_IRQ 215 IRQ_TYPE_LEVEL_HIGH>;
++
++			msi-controller;
++			msi-parent = <&pcie>;
++			/* a campainha das MSIs é fixa em 0xbffff000 */
++			msi-ranges = <&aic AIC_IRQ 224 IRQ_TYPE_EDGE_RISING 32>;
++
++			/*
++			 * Só a porta 1 tem DART. A DART só enxerga DMA em
++			 * 0x80000000..0xbfffefff (a mesma janela do iOS); a página
++			 * da campainha acima disso não é traduzida.
++			 */
++			iommu-map = <0x100 &dart_apcie1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
++			iommu-map-mask = <0xff00>;
++
++			bus-range = <0 8>;
++			#address-cells = <3>;
++			#size-cells = <2>;
++			ranges = <0x43000000 0x6 0x20000000 0x6 0x20000000 0x1 0xa0000000>,
++				 <0x02000000 0x0 0xc0000000 0x7 0xc0000000 0x0 0x40000000>;
++
++			/* encadeado em PCIE_AUX e PCIE no t7000-pmgr.dtsi */
++			power-domains = <&ps_pcie_ref>;
++			status = "disabled";
++
++			port01: pci@1,0 {
++				device_type = "pci";
++				reg = <0x800 0x0 0x0 0x0 0x0>;
++
++				#address-cells = <3>;
++				#size-cells = <2>;
++				ranges;
++
++				interrupt-controller;
++				#interrupt-cells = <1>;
++
++				interrupt-map-mask = <0 0 0 7>;
++				interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
++						<0 0 0 2 &port01 0 0 0 1>,
++						<0 0 0 3 &port01 0 0 0 2>,
++						<0 0 0 4 &port01 0 0 0 3>;
++				status = "disabled";
++			};
++		};
++
++		dart_apcie1: iommu@602002000 {
++			compatible = "apple,t7000-dart", "apple,s5l8960x-dart";
++			reg = <0x6 0x02002000 0x0 0x2000>;
++			#iommu-cells = <5>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>;
++			power-domains = <&ps_pcie_ref>;
++			status = "disabled";
++		};
+ 	};
+ 
+ 	timer {
+diff --git a/arch/arm64/boot/dts/apple/t7000-pmgr.dtsi b/arch/arm64/boot/dts/apple/t7000-pmgr.dtsi
+index 5948fa7..c2699c0 100644
+--- a/arch/arm64/boot/dts/apple/t7000-pmgr.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-pmgr.dtsi
+@@ -427,6 +427,8 @@
+ 		#power-domain-cells = <0>;
+ 		#reset-cells = <0>;
+ 		label = "pcie_ref";
++		/* ordem do iOS: PCIE, depois PCIE_AUX, depois PCIE_REF */
++		power-domains = <&ps_pcie_aux>;
+ 	};
+ 
+ 	ps_hsic0_phy: power-controller@20200 {
+@@ -593,6 +595,7 @@
+ 		#power-domain-cells = <0>;
+ 		#reset-cells = <0>;
+ 		label = "pcie_aux";
++		power-domains = <&ps_pcie>;
+ 	};
+ 
+ 	ps_gfx: power-controller@20320 {
+diff --git a/arch/arm64/boot/dts/apple/t7000-6.dtsi b/arch/arm64/boot/dts/apple/t7000-6.dtsi
+index d806865..5eaa5b1 100644
+--- a/arch/arm64/boot/dts/apple/t7000-6.dtsi
++++ b/arch/arm64/boot/dts/apple/t7000-6.dtsi
+@@ -66,6 +66,14 @@
+ 		#address-cells = <1>;
+ 		#size-cells = <1>;
+ 
++		/* config de cada pino em 0x400 + 2 * pino (D2186) */
++		pmic_gpio: gpio@400 {
++			compatible = "apple,adi-pmic-gpio";
++			reg = <0x400 0x2a>;
++			gpio-controller;
++			#gpio-cells = <2>;
++		};
++
+ 		rtc@5c0 {
+ 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
+ 			reg = <0x5c0 0x10>;
+diff --git a/arch/arm64/boot/dts/apple/t7000-n61.dts b/arch/arm64/boot/dts/apple/t7000-n61.dts
+index 07749e4..75e5d70 100644
+--- a/arch/arm64/boot/dts/apple/t7000-n61.dts
++++ b/arch/arm64/boot/dts/apple/t7000-n61.dts
+@@ -40,6 +40,48 @@
+ };
+ 
+ /* PMU da tela "Chestnut" (ADT i2c0/display-pmu): sem driver, só para o touch */
++&pmic_gpio {
++	gpio-line-names = "", "", "", "", "", "OSCAR_RESET_L",
++			  "", "", "BT_REG_ON", "", "WL_REG_ON", "OSCAR_CLK32K";
++	/*
++	 * GPIO 11 do PMU: o LLB programa e o iOS nunca mais escreve (provável
++	 * clock de 32 kHz do coprocessador M8). Uma config errada travou o I2C
++	 * do PMU no aparelho de outro projeto: fora do alcance do gpiolib.
++	 */
++	gpio-reserved-ranges = <11 1>;
++};
++
++&pcie {
++	status = "okay";
++};
++
++&dart_apcie1 {
++	status = "okay";
++};
++
++/* ADT /arm-io/apcie/pci-bridge1: a metade Wi-Fi do módulo BCM4345 */
++&port01 {
++	/* ADT function-perst: GPIO 77 */
++	reset-gpios = <&pinctrl 77 GPIO_ACTIVE_LOW>;
++	/* ADT uart4/wlan function-reg_on: GPIO 10 do PMU = WL_REG_ON */
++	pwren-gpios = <&pmic_gpio 10 GPIO_ACTIVE_HIGH>;
++	/* ADT maximum-link-speed */
++	max-link-speed = <1>;
++	/* o iOS não toca o config space em L1/L2: ASPM desligado */
++	aspm-no-l0s;
++	aspm-no-l1;
++	aspm-no-l1ss;
++	bus-range = <1 1>;
++	status = "okay";
++
++	wifi0: wifi@0,0 {
++		compatible = "pci14e4,43ab";
++		reg = <0x10000 0x0 0x0 0x0 0x0>;
++		/* ADT module-instance: brcmfmac4345b1-pcie.apple,tempranillo.* */
++		brcm,board-type = "apple,tempranillo";
++	};
++};
++
+ &i2c0 {
+ 	chestnut: display-pmu@27 {
+ 		compatible = "apple,chestnut";

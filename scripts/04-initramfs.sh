@@ -44,6 +44,15 @@ else
   echo "aviso: sem firmware limpo do ANS (rode ./scripts/11-firmware-ans.sh)"
 fi
 
+# Wi-Fi (BCM4345 B1): firmware, CLM, TX-cap e NVRAM do módulo "tempranillo", tirados
+# do iOS por scripts/12-firmware-wifi.sh. São da Apple/Broadcom: ficam só no build/.
+if ls "$BUILD/firmware/wifi/"brcmfmac4345b1-pcie.* >/dev/null 2>&1; then
+  install -d "$WORK/lib/firmware/brcm"
+  install -m 644 "$BUILD/firmware/wifi/"brcmfmac4345b1-pcie.* "$WORK/lib/firmware/brcm/"
+else
+  echo "aviso: sem firmware do Wi-Fi (rode ./scripts/12-firmware-wifi.sh)"
+fi
+
 log "Módulos do kernel (.ko) -> /lib/modules"
 if [ -d "$(dirname "$KSRC")/modules/lib/modules" ]; then
   mkdir -p "$WORK/lib/modules"
