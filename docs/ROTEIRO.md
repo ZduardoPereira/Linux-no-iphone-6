@@ -247,6 +247,12 @@ estudados e adaptados (`kernel/patches/0015`–`0023`, com autoria original).
       `inicio` pergunta direto ao `wpa_supplicant` pelo socket de controle (STATUS e
       SIGNAL_POLL, como o `wpa_cli`); com ele parado, mostra o `/tmp/wifi-estado` que o
       script `wifi` deixa (ligando, erro, nenhuma rede salva)
+- [x] Escolher a rede pela tela: tocar no cartão do Wi-Fi abre a lista (busca pelo
+      `wpa_supplicant`; liga o Wi-Fi se estiver desligado). Rede nova pede a senha no
+      teclado de toque (8 a 63 caracteres, com botão de mostrar); rede salva tem
+      Conectar/Esquecer; rede aberta conecta sem senha. Quem conecta é o próprio
+      `wifi conectar`, em segundo plano, com a senha pelo stdin (não aparece no `ps`).
+      Testado no aparelho com toques simulados (eventos escritos no `/dev/input/event1`)
 - [x] Reconexão sozinha: numa queda da rede (~1 h sem ela), o `wpa_supplicant` procurou a
       cada ~9 s e reconectou 3 s depois de ela voltar, com endereço novo pelo `udhcpc`.
       O "sched scan" (busca feita pelo próprio chip) falha com este firmware; ele usa

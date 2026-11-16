@@ -1,8 +1,9 @@
 #!/bin/sh
 # wifi — Wi-Fi do iPhone 6 (Broadcom BCM4345 no PCIe do A8, driver brcmfmac).
-#   wifi ligar             carrega os drivers na ordem certa e liga a wlan0
+#   wifi ligar             carrega os drivers, liga a wlan0 e o wpa_supplicant
 #   wifi redes             procura redes (nome, sinal, canal)
-#   wifi conectar "Nome"   pede a senha (sem mostrar), conecta, pega IP e salva a rede
+#   wifi conectar "Nome"   pede a senha (sem mostrar; rede aberta: só Enter), conecta,
+#                          pega IP e salva a rede
 #   wifi auto              conecta sozinho às redes salvas (o boot chama este)
 #   wifi esquecer "Nome"   apaga uma rede salva
 #   wifi estado            rede atual, sinal e endereço
@@ -66,6 +67,14 @@ tira_rede() (
 
 cli() { wpa_cli -p /run/wpa_supplicant -i wlan0 "$@"; }
 
+# o arquivo das redes, legível só pelo root. ctrl_interface = o socket que o wpa_cli e
+# a tela inicial usam para conversar com o wpa_supplicant
+cria_conf() {
+    mkdir -p /etc/wpa_supplicant
+    [ -f "$CONF" ] || (umask 077; printf 'ctrl_interface=/run/wpa_supplicant\nupdate_config=1\n' > "$CONF")
+    chmod 600 "$CONF"
+}
+
 # wpa_supplicant: associa (e reassocia, se cair) sozinho a qualquer rede salva ao alcance
 supplicant() {
     killall wpa_supplicant 2>/dev/null || true
@@ -92,8 +101,12 @@ na_ram() { ! grep -q '^/dev/mapper/linux / ' /proc/mounts; }
 
 case "$1" in
 ligar)
+    # driver + wpa_supplicant, mesmo sem rede salva: a tela inicial chama este antes de
+    # procurar redes (a busca é pedida ao wpa_supplicant)
     liga
-    echo "wifi: wlan0 ligada"
+    cria_conf
+    pidof wpa_supplicant >/dev/null || supplicant
+    echo "wifi: ligado"
     ;;
 redes)
     liga
@@ -112,16 +125,20 @@ redes)
 conectar)
     [ -n "$2" ] || { echo "uso: wifi conectar \"nome da rede\""; exit 1; }
     liga
-    mkdir -p /etc/wpa_supplicant
-    [ -f "$CONF" ] || (umask 077; printf 'ctrl_interface=/run/wpa_supplicant\nupdate_config=1\n' > "$CONF")
-    chmod 600 "$CONF"
+    cria_conf
     NOVA=
     if ! tem_rede "$2"; then
-        printf 'Senha de "%s": ' "$2"
-        stty -echo 2>/dev/null || true; read -r SENHA; stty echo 2>/dev/null || true; echo
-        # wpa_passphrase guarda só a chave derivada (psk=...), não a senha em texto
-        wpa_passphrase "$2" "$SENHA" | grep -v '^[[:space:]]*#psk=' >> "$CONF" ||
-            { echo "wifi: senha inválida (8 a 63 caracteres)"; exit 1; }
+        # a senha vem do teclado, ou do stdin quando quem chama é a tela inicial
+        printf 'Senha de "%s" (rede aberta: só Enter): ' "$2"
+        SENHA=
+        stty -echo 2>/dev/null || true; read -r SENHA || true; stty echo 2>/dev/null || true; echo
+        if [ -z "$SENHA" ]; then
+            printf 'network={\n\tssid="%s"\n\tkey_mgmt=NONE\n}\n' "$2" >> "$CONF"   # aberta
+        else
+            # wpa_passphrase guarda só a chave derivada (psk=...), não a senha em texto
+            wpa_passphrase "$2" "$SENHA" | grep -v '^[[:space:]]*#psk=' >> "$CONF" ||
+                { echo "wifi: senha inválida (8 a 63 caracteres)"; exit 1; }
+        fi
         unset SENHA
         NOVA=1
     fi
@@ -192,6 +209,6 @@ desligar)
     echo "wifi: desligado"
     ;;
 *)
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
