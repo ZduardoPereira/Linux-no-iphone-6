@@ -73,4 +73,6 @@ for i in 1 2 3 4 5; do [ -e /sys/class/net/usb0 ] && break; sleep 1; done
 ip addr add "$IP/24" dev usb0 2>/dev/null && ip link set usb0 up
 # Internet pelo PC (fase 3): o PC é o roteador. Só funciona depois de rodar
 # ./scripts/08-internet.sh no PC, que também ajusta o DNS.
-ip route add default via "${IP%.*}.2" 2>/dev/null
+# metric 900: rota de reserva. Com o Wi-Fi conectado (rota dele: metric ~300), a
+# internet sai pelo Wi-Fi; o cabo continua para o SSH (rede 172.16.42.0/24).
+ip route add default via "${IP%.*}.2" metric 900 2>/dev/null

@@ -53,6 +53,13 @@ else
   echo "aviso: sem firmware do Wi-Fi (rode ./scripts/12-firmware-wifi.sh)"
 fi
 
+# Redes Wi-Fi salvas (./scripts/13-wifi-salvar.sh): nome + chave derivada da senha.
+# Ficam só no build/ (fora do git) e voltam ao iPhone a cada boot: ele conecta sozinho.
+if [ -s "$BUILD/wifi/wpa_supplicant.conf" ]; then
+  install -D -m 600 "$BUILD/wifi/wpa_supplicant.conf" "$WORK/etc/wpa_supplicant/wpa_supplicant.conf"
+  log "Wi-Fi: $(grep -c '^network={' "$BUILD/wifi/wpa_supplicant.conf") rede(s) salva(s) (build/wifi/)"
+fi
+
 log "Módulos do kernel (.ko) -> /lib/modules"
 if [ -d "$(dirname "$KSRC")/modules/lib/modules" ]; then
   mkdir -p "$WORK/lib/modules"

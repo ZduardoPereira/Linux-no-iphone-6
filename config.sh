@@ -47,6 +47,8 @@ BOOTARGS="$BOOTARGS gpt"
 # Fase 8 (Wi-Fi): o sistema sobe na RAM e o ANS (flash) nem liga, para um travamento
 # nos testes do PCIe não pegar o ANS acordado. Tirar quando o Wi-Fi estiver pronto.
 BOOTARGS="$BOOTARGS semflash"
+# O Wi-Fi conecta sozinho no boot se houver rede salva (./scripts/13-wifi-salvar.sh).
+# Para o boot não ligar o Wi-Fi: BOOTARGS="$BOOTARGS semwifi"
 # Rede via USB: o iPhone fica com .1 e o PC com .2
 PHONE_IP="172.16.42.1"
 HOST_IP="172.16.42.2"

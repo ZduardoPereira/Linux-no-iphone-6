@@ -13,6 +13,10 @@ monta configfs configfs /sys/kernel/config
 mkdir -p /dev/pts && monta devpts devpts /dev/pts
 monta tmpfs    tmpfs    /tmp
 hostname -F /etc/hostname
+# Mensagens dos serviços (wpa_supplicant, udhcpc...): "logread" mostra. -C256 = guarda
+# só os últimos 256 KB na RAM (nada vai para a flash, que acordaria o ANS). Com 64 KB,
+# uma hora sem rede (o wpa_supplicant reclama a cada 9 s) apagava o começo da história.
+syslogd -C256
 
 if grep -q '^/dev/mapper/linux / ' /proc/mounts; then
   ONDE="sistema na flash interna"
@@ -64,6 +68,14 @@ elif ! grep -qw semflash /proc/cmdline; then
     else
       echo "erro (ver /tmp/flash.log)" > /tmp/flash-estado
     fi ) &
+fi
+
+# Wi-Fi: conecta sozinho a uma rede salva (quem salva é o "wifi conectar"; com o
+# sistema na RAM, as redes vêm do PC: ./scripts/13-wifi-salvar.sh). Em segundo plano:
+# o boot não espera. Sem rede salva, o rádio nem liga. "semwifi" na linha de comando
+# do kernel pula. Registro: /tmp/wifi.log
+if ! grep -qw semwifi /proc/cmdline; then
+  ( wifi auto > /tmp/wifi.log 2>&1 ) &
 fi
 
 echo "Pronto. No PC: ./scripts/07-conectar.sh"

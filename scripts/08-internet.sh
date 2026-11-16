@@ -40,7 +40,8 @@ DNS="$(resolvectl dns "$WAN_IF" 2>/dev/null | awk '{for(i=4;i<=NF;i++) if ($i ~ 
 DNS="${DNS:-1.1.1.1}"
 
 log "iPhone: rota padrão via $HOST_IP, DNS $DNS"
-"$ROOT/scripts/iphone.sh" "ip route replace default via $HOST_IP && echo 'nameserver $DNS' > /etc/resolv.conf && ping -c 2 -W 3 $DNS >/dev/null && echo 'internet OK (ping $DNS)'" 20
+# metric 900, a mesma do usb-gadget.sh: com o Wi-Fi conectado, ele continua na frente
+"$ROOT/scripts/iphone.sh" "ip route replace default via $HOST_IP metric 900 && echo 'nameserver $DNS' > /etc/resolv.conf && ping -c 2 -W 3 $DNS >/dev/null && echo 'internet OK (ping $DNS)'" 20
 "$ROOT/scripts/iphone.sh" "wget -q -O /dev/null http://dl-cdn.alpinelinux.org/alpine/ && echo 'DNS + HTTP OK (alpinelinux.org)'" 30 \
   || echo "aviso: ping funcionou mas HTTP/DNS não — veja o firewall/DNS da sua rede"
 log "Pronto. No iPhone: apk update && apk add i2c-tools evtest dropbear"

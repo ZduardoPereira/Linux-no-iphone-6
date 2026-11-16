@@ -4,7 +4,8 @@
  * Mostra, ao vivo, o que os nossos drivers leem do hardware:
  *   bateria (bq27540-battery), carregador (sn2400-usb), temperatura (apple_temp_*),
  *   brilho (backlight), vibração (drv260x, via /usr/local/bin/vibrar), sistema,
- *   flash interna (ext4 em /mnt/flash, montado pelo /init com flash-linux).
+ *   flash interna (ext4 em /mnt/flash, montado pelo /init com flash-linux),
+ *   Wi-Fi (rede, sinal e endereço, perguntados ao wpa_supplicant).
  * Botões físicos: Power apaga/acende a tela, Volume +/- muda o brilho.
  * Botão "Desligar": salva a flash (flash-linux desligar) antes de cortar a energia.
  *
@@ -12,6 +13,7 @@
  * (lv_evdev). O laço principal dorme até o próximo evento do LVGL ou um botão.
  */
 #include "lvgl/lvgl.h"
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/input.h>
@@ -21,7 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/statvfs.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -94,6 +98,7 @@ static int temp_max(void)
 static lv_obj_t *l_hora, *l_bat, *l_relogio, *l_data;
 static lv_obj_t *v_bat, *d_bat, *v_temp, *d_temp, *v_sis, *d_sis, *v_usb, *d_usb;
 static lv_obj_t *v_flash, *d_flash;
+static lv_obj_t *v_wifi, *n_wifi, *d_wifi;
 static lv_obj_t *slider;
 static long brilho_max = 2047;
 
@@ -148,6 +153,117 @@ static void retoma_tela(void)
 
 static int flash_montada(void);
 
+/* ---------- Wi-Fi: perguntas ao wpa_supplicant ---------- */
+/* Pelo socket de controle dele, o mesmo que o wpa_cli usa: a resposta vem em menos de
+ * 1 ms, sem rodar programa nenhum. Devolve o tamanho da resposta, ou -1 se o
+ * wpa_supplicant não estiver rodando. */
+static int wpa_pede(const char *cmd, char *resp, size_t n)
+{
+    struct sockaddr_un eu = { .sun_family = AF_UNIX };
+    struct sockaddr_un ele = { .sun_family = AF_UNIX, .sun_path = "/run/wpa_supplicant/wlan0" };
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0), r = -1;
+    if (fd < 0) return -1;
+    /* bind só com a família: o kernel dá a este socket um endereço abstrato único, para
+     * onde o wpa_supplicant manda a resposta (sem criar arquivo nenhum) */
+    if (bind(fd, (struct sockaddr *)&eu, sizeof(sa_family_t)) == 0 &&
+        connect(fd, (struct sockaddr *)&ele, sizeof(ele)) == 0 &&
+        send(fd, cmd, strlen(cmd), 0) >= 0) {
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (poll(&p, 1, 300) > 0 && (r = recv(fd, resp, n - 1, 0)) >= 0)
+            resp[r] = 0;
+    }
+    close(fd);
+    return r;
+}
+
+/* valor de "chave=..." numa resposta do wpa_supplicant (uma chave por linha) */
+static int campo(const char *resp, const char *chave, char *val, size_t n)
+{
+    size_t k = strlen(chave);
+    for (const char *l = resp; l && *l; ) {
+        if (!strncmp(l, chave, k) && l[k] == '=') {
+            size_t m = strcspn(l + k + 1, "\n");
+            if (m >= n) m = n - 1;
+            memcpy(val, l + k + 1, m);
+            val[m] = 0;
+            return 1;
+        }
+        l = strchr(l, '\n');
+        if (l) l++;
+    }
+    val[0] = 0;
+    return 0;
+}
+
+/* O wpa_supplicant escreve os bytes fora do ASCII do nome da rede como \xNN
+ * (é = \xc3\xa9), e \" e \\ para aspas e barra: devolve o texto original. */
+static void desescapa(char *s)
+{
+    char *o = s;
+    for (const char *i = s; *i; i++) {
+        if (*i != '\\' || !i[1]) { *o++ = *i; continue; }
+        i++;
+        if (*i == 'x' && isxdigit((unsigned char)i[1]) && isxdigit((unsigned char)i[2])) {
+            char h[3] = { i[1], i[2], 0 };
+            *o++ = (char)strtol(h, NULL, 16);
+            i += 2;
+        } else if (*i == 'n' || *i == 'r' || *i == 't' || *i == 'e') {
+            *o++ = ' ';                                   /* controle: vira espaço */
+        } else {
+            *o++ = *i;                                    /* \" e \\ */
+        }
+    }
+    *o = 0;
+}
+
+/* cartão do Wi-Fi; devolve 1 se está conectado e com endereço (ícone na barra) */
+static int atualiza_wifi(void)
+{
+    char st[1024], sinal[256], estado[32], nome[160], ip[48], s[96];
+    lv_obj_set_style_text_color(v_wifi, lv_color_white(), 0);
+    lv_label_set_text(v_wifi, "--");
+    lv_label_set_text(d_wifi, "");
+    if (wpa_pede("STATUS", st, sizeof(st)) <= 0) {
+        /* wpa_supplicant parado: o script wifi deixa o motivo em /tmp/wifi-estado */
+        le_txt("/tmp/wifi-estado", s, sizeof(s));
+        if (!s[0])
+            snprintf(s, sizeof(s), "%s",
+                     access("/sys/class/net/wlan0", F_OK) ? "desligado" : "ligado, sem rede");
+        lv_label_set_text(n_wifi, s);
+        return 0;
+    }
+    campo(st, "wpa_state", estado, sizeof(estado));
+    campo(st, "ssid", nome, sizeof(nome));
+    desescapa(nome);
+    campo(st, "ip_address", ip, sizeof(ip));
+    if (strcmp(estado, "COMPLETED")) {
+        /* associando e conferindo a senha, ou procurando uma rede salva ao alcance */
+        if (nome[0] && strcmp(estado, "SCANNING") && strcmp(estado, "DISCONNECTED") &&
+            strcmp(estado, "INACTIVE"))
+            lv_label_set_text_fmt(n_wifi, "conectando: %s", nome);
+        else
+            lv_label_set_text(n_wifi, "procurando rede...");
+        return 0;
+    }
+    long rssi = 0;
+    if (wpa_pede("SIGNAL_POLL", sinal, sizeof(sinal)) > 0 && campo(sinal, "RSSI", s, sizeof(s)))
+        rssi = atol(s);
+    const char *falta_ip = "pegando endereço...";
+    if (rssi) {
+        /* palavras sem "perna" (g, p, q...): a linha do nome fica logo abaixo delas */
+        lv_label_set_text(v_wifi, rssi >= -55 ? "Ótimo" : rssi >= -67 ? "Bom" :
+                                  rssi >= -75 ? "Médio" : "Fraco");
+        lv_obj_set_style_text_color(v_wifi, lv_color_hex(rssi >= -67 ? 0x51cf66 :
+                                                         rssi >= -75 ? 0xfcc419 : 0xff6b5b), 0);
+        lv_label_set_text_fmt(d_wifi, "%ld dBm · %s", rssi, ip[0] ? ip : falta_ip);
+    } else {
+        lv_label_set_text(v_wifi, "Ok");
+        lv_label_set_text(d_wifi, ip[0] ? ip : falta_ip);
+    }
+    lv_label_set_text(n_wifi, nome);
+    return ip[0] != 0;
+}
+
 static void atualiza(lv_timer_t *t)
 {
     (void)t;
@@ -168,7 +284,9 @@ static void atualiza(lv_timer_t *t)
     int carregando = !strcmp(s, "Charging") || !strcmp(s, "Full");
     const char *icone = cap > 80 ? LV_SYMBOL_BATTERY_FULL : cap > 55 ? LV_SYMBOL_BATTERY_3 :
                         cap > 30 ? LV_SYMBOL_BATTERY_2 : cap > 10 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
-    lv_label_set_text_fmt(l_bat, "%s%s  %ld%%", carregando ? LV_SYMBOL_CHARGE " " : "", icone, cap);
+    int wifi = atualiza_wifi();
+    lv_label_set_text_fmt(l_bat, "%s%s%s  %ld%%", wifi ? LV_SYMBOL_WIFI "    " : "",
+                          carregando ? LV_SYMBOL_CHARGE " " : "", icone, cap);
     lv_label_set_text_fmt(v_bat, "%ld%%", cap);
     lv_label_set_text_fmt(d_bat, "%ld,%02ld V · %ld,%ld °C · %ld ciclos%s", mv / 1000, (mv % 1000) / 10,
                           tb / 10, tb % 10, ciclos, carregando ? " · carregando" : "");
@@ -202,7 +320,7 @@ static void atualiza(lv_timer_t *t)
         unsigned long long livre = sv.f_bavail * bs / 100000000ULL;   /* décimos de GB */
         unsigned long long total = sv.f_blocks * bs / 1000000000ULL;
         lv_label_set_text_fmt(v_flash, "%llu,%llu GB", livre / 10, livre % 10);
-        lv_label_set_text_fmt(d_flash, "livres de %llu GB · ext4 em /mnt/flash", total);
+        lv_label_set_text_fmt(d_flash, "livres de %llu GB", total);
     } else {
         le_txt("/tmp/flash-estado", s, sizeof(s));
         lv_label_set_text(v_flash, "--");
@@ -399,8 +517,18 @@ static void monta_tela(void)
     cartao(grade, LV_SYMBOL_WARNING, "Temperatura", &v_temp, &d_temp);
     cartao(grade, LV_SYMBOL_SETTINGS, "Memória", &v_sis, &d_sis);
     cartao(grade, LV_SYMBOL_USB, "Carregador", &v_usb, &d_usb);
-    lv_obj_set_width(cartao(grade, LV_SYMBOL_SD_CARD, "Flash interna", &v_flash, &d_flash),
-                     lv_pct(100));
+    cartao(grade, LV_SYMBOL_SD_CARD, "Flash interna", &v_flash, &d_flash);
+    /* Wi-Fi: qualidade do sinal grande; embaixo, o nome da rede e "dBm · endereço",
+     * uma linha cada (texto comprido termina em "...") */
+    lv_obj_t *w = cartao(grade, LV_SYMBOL_WIFI, "Wi-Fi", &v_wifi, &d_wifi);
+    int32_t linha = lv_font_get_line_height(f20);
+    lv_obj_set_height(d_wifi, linha);
+    lv_label_set_long_mode(d_wifi, LV_LABEL_LONG_MODE_DOTS);
+    n_wifi = lv_label_create(w);
+    lv_obj_set_style_text_font(n_wifi, f20, 0);
+    lv_obj_set_size(n_wifi, lv_pct(100), linha);
+    lv_label_set_long_mode(n_wifi, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_align(n_wifi, LV_ALIGN_BOTTOM_LEFT, 0, -linha - 2);
 
     lv_obj_t *l = lv_label_create(grade);                 /* brilho */
     lv_label_set_text(l, LV_SYMBOL_IMAGE "  Brilho");

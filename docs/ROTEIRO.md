@@ -236,7 +236,21 @@ estudados e adaptados (`kernel/patches/0015`–`0023`, com autoria original).
       conectar com senha digitada sem aparecer, estado, desligar)
 - [x] Conectar a uma rede (`wifi conectar "Nome"`): internet e DNS pela `wlan0` (sinal
       −37 dBm, 65 Mbit/s); o `udhcpc` fica em segundo plano renovando o endereço
-- [ ] Ligar o Wi-Fi sozinho no boot e mostrar na tela inicial
+- [x] Ligar o Wi-Fi sozinho no boot: `wifi auto` em segundo plano no `iphone6-init`
+      (conectado ~9 s depois do boot; sem rede salva o rádio nem liga; `semwifi` pula).
+      Com o sistema na RAM, as redes voltam do PC a cada boot
+      (`scripts/13-wifi-salvar.sh` → `build/wifi/`, fora do git). O roteador dá o
+      endereço por 1 h, por isso o `udhcpc` fica rodando para renová-lo. A rota pelo
+      cabo virou reserva (`metric 900`), e o `syslogd -C256` guarda os logs na RAM (`logread`)
+- [x] Wi-Fi na tela inicial: cartão com a qualidade do sinal (Ótimo/Bom/Médio/Fraco), o
+      nome da rede e "dBm · endereço", e o ícone na barra de status quando conectado. O
+      `inicio` pergunta direto ao `wpa_supplicant` pelo socket de controle (STATUS e
+      SIGNAL_POLL, como o `wpa_cli`); com ele parado, mostra o `/tmp/wifi-estado` que o
+      script `wifi` deixa (ligando, erro, nenhuma rede salva)
+- [x] Reconexão sozinha: numa queda da rede (~1 h sem ela), o `wpa_supplicant` procurou a
+      cada ~9 s e reconectou 3 s depois de ela voltar, com endereço novo pelo `udhcpc`.
+      O "sched scan" (busca feita pelo próprio chip) falha com este firmware; ele usa
+      a busca normal
 - [ ] Rever, agora em *Non-secure*: o DMA do USB (sem `apple_pio`) e os contornos do
       memcache no driver da flash (buffers Device)
 - [ ] Tirar o `semflash` do `config.sh` (os testes do PCIe rodaram com a flash desligada)

@@ -2,32 +2,98 @@
 # wifi — Wi-Fi do iPhone 6 (Broadcom BCM4345 no PCIe do A8, driver brcmfmac).
 #   wifi ligar             carrega os drivers na ordem certa e liga a wlan0
 #   wifi redes             procura redes (nome, sinal, canal)
-#   wifi conectar "Nome"   pede a senha (sem mostrar), conecta e pega IP por DHCP
+#   wifi conectar "Nome"   pede a senha (sem mostrar), conecta, pega IP e salva a rede
+#   wifi auto              conecta sozinho às redes salvas (o boot chama este)
+#   wifi esquecer "Nome"   apaga uma rede salva
 #   wifi estado            rede atual, sinal e endereço
 #   wifi desligar          desconecta e descarrega o driver do Wi-Fi
 #
 # A ordem importa: a DART (IOMMU) do PCIe só responde depois que a porta 1 do
 # PCIe liga, então apple-dart carrega depois do pcie-apple, e o brcmfmac por último.
-# Redes salvas: /etc/wpa_supplicant/wpa_supplicant.conf (a senha fica guardada lá).
+# Redes salvas: /etc/wpa_supplicant/wpa_supplicant.conf (nome + chave derivada da
+# senha; a senha em texto não fica). Com o sistema na RAM esse arquivo some no reboot:
+# no PC, ./scripts/13-wifi-salvar.sh o guarda e o 04-initramfs.sh o devolve.
+# Mensagens do wpa_supplicant e do udhcpc (por que não conectou etc.): logread
 set -e
 CONF=/etc/wpa_supplicant/wpa_supplicant.conf
+# Para a tela inicial: o que dizer enquanto o wpa_supplicant não está rodando (ligando,
+# erro, sem rede salva). Com ele rodando, a tela pergunta direto a ele.
+ESTADO=/tmp/wifi-estado
+
+falha() { echo "wifi: $1"; echo "erro: $1" > "$ESTADO"; exit 1; }
 
 liga() {
     [ -e /sys/class/net/wlan0 ] && { ip link set wlan0 up; return; }
-    modprobe pcie-apple
+    echo "ligando..." > "$ESTADO"
+    modprobe pcie-apple || falha "modprobe pcie-apple"
     for i in $(seq 20); do [ -e /sys/bus/pci/devices/0000:01:00.0 ] && break; sleep 0.25; done
-    [ -e /sys/bus/pci/devices/0000:01:00.0 ] || { echo "wifi: o chip não apareceu no PCIe"; exit 1; }
-    modprobe apple-dart
-    modprobe brcmfmac
+    [ -e /sys/bus/pci/devices/0000:01:00.0 ] || falha "o chip não apareceu no PCIe"
+    modprobe apple-dart || falha "modprobe apple-dart"
+    modprobe brcmfmac || falha "modprobe brcmfmac"
     for i in $(seq 40); do [ -e /sys/class/net/wlan0 ] && break; sleep 0.25; done
-    [ -e /sys/class/net/wlan0 ] || { echo "wifi: a wlan0 não apareceu (dmesg | grep brcmfmac)"; exit 1; }
+    [ -e /sys/class/net/wlan0 ] || falha "a wlan0 não apareceu (dmesg | grep brcmfmac)"
     ip link set wlan0 up
+    rm -f "$ESTADO"
 }
+
+# A linha <TAB>ssid="Nome" que o wpa_passphrase escreve. É comparada inteira, como
+# texto (nomes de rede podem ter qualquer caractere).
+linha_ssid() { printf '\tssid="%s"' "$1"; }
+tem_rede() { [ -f "$CONF" ] && grep -qxF "$(linha_ssid "$1")" "$CONF"; }
+
+# id da rede no wpa_supplicant = posição do bloco network={...} no arquivo (0, 1, ...)
+id_rede() {
+    LINHA="$(linha_ssid "$1")" awk '
+        $0 == "network={" { n++ }
+        $0 == ENVIRON["LINHA"] { print n - 1; exit }' "$CONF"
+}
+
+# apaga o bloco network={...} dessa rede (entre parênteses: o umask vale só aqui dentro,
+# e a cópia nova do arquivo nasce legível só pelo root, como o original)
+tira_rede() (
+    umask 077
+    LINHA="$(linha_ssid "$1")" awk '
+        $0 == "network={" { bloco = $0; dentro = 1; achou = 0; next }
+        dentro {
+            bloco = bloco "\n" $0
+            if ($0 == ENVIRON["LINHA"]) achou = 1
+            if ($0 == "}") { if (!achou) print bloco; dentro = 0 }
+            next
+        }
+        { print }' "$CONF" > "$CONF.novo"
+    mv "$CONF.novo" "$CONF"
+)
+
+cli() { wpa_cli -p /run/wpa_supplicant -i wlan0 "$@"; }
+
+# wpa_supplicant: associa (e reassocia, se cair) sozinho a qualquer rede salva ao alcance
+supplicant() {
+    killall wpa_supplicant 2>/dev/null || true
+    for i in $(seq 30); do pidof wpa_supplicant >/dev/null || break; sleep 0.1; done
+    mkdir -p /run/wpa_supplicant
+    wpa_supplicant -B -s -i wlan0 -c "$CONF" >/dev/null
+}
+
+# COMPLETED = associado E com a senha aceita (o "Connected" do iw aparece antes da
+# senha ser conferida, então não serve para saber se ela está certa)
+conectado() { cli status 2>/dev/null | grep -qx 'wpa_state=COMPLETED'; }
+
+# Endereço por DHCP. Sem -q, o udhcpc fica em segundo plano e renova o endereço antes
+# de acabar o "aluguel" que o roteador deu (sem isso, a internet cai depois de horas).
+# O ^ no pkill: só o processo cujo comando COMEÇA com udhcpc; sem ele, o pkill mataria
+# também qualquer shell que tivesse esse texto no próprio comando.
+dhcp() {
+    pkill -f '^udhcpc -i wlan0' 2>/dev/null || true
+    udhcpc -i wlan0 -S "$@" >/dev/null 2>&1
+}
+
+# sistema na RAM: o que muda no iPhone some no reboot, e as redes vêm do PC
+na_ram() { ! grep -q '^/dev/mapper/linux / ' /proc/mounts; }
 
 case "$1" in
 ligar)
     liga
-    echo "wifi: wlan0 ligada ($(cat /sys/class/net/wlan0/address))"
+    echo "wifi: wlan0 ligada"
     ;;
 redes)
     liga
@@ -47,35 +113,68 @@ conectar)
     [ -n "$2" ] || { echo "uso: wifi conectar \"nome da rede\""; exit 1; }
     liga
     mkdir -p /etc/wpa_supplicant
-    [ -f "$CONF" ] || printf 'ctrl_interface=/run/wpa_supplicant\nupdate_config=1\n' > "$CONF"
+    [ -f "$CONF" ] || (umask 077; printf 'ctrl_interface=/run/wpa_supplicant\nupdate_config=1\n' > "$CONF")
     chmod 600 "$CONF"
-    if ! grep -qF "ssid=\"$2\"" "$CONF"; then
+    NOVA=
+    if ! tem_rede "$2"; then
         printf 'Senha de "%s": ' "$2"
-        stty -echo 2>/dev/null; read -r SENHA; stty echo 2>/dev/null; echo
+        stty -echo 2>/dev/null || true; read -r SENHA; stty echo 2>/dev/null || true; echo
         # wpa_passphrase guarda só a chave derivada (psk=...), não a senha em texto
-        wpa_passphrase "$2" "$SENHA" | grep -v '^\s*#psk=' >> "$CONF" ||
+        wpa_passphrase "$2" "$SENHA" | grep -v '^[[:space:]]*#psk=' >> "$CONF" ||
             { echo "wifi: senha inválida (8 a 63 caracteres)"; exit 1; }
         unset SENHA
+        NOVA=1
     fi
-    killall wpa_supplicant 2>/dev/null || true
-    mkdir -p /run/wpa_supplicant
-    wpa_supplicant -B -i wlan0 -c "$CONF" -s >/dev/null
+    supplicant
+    # só esta rede, mesmo que outra salva esteja ao alcance
+    cli select_network "$(id_rede "$2")" >/dev/null
     printf "wifi: conectando"
-    for i in $(seq 30); do
-        iw dev wlan0 link | grep -q "^Connected" && break
-        printf "."; sleep 1
-    done
+    for i in $(seq 30); do conectado && break; printf "."; sleep 1; done
     echo
-    iw dev wlan0 link | grep -q "^Connected" || { echo "wifi: não conectou (senha errada? veja: logread / dmesg)"; exit 1; }
-    # a rota padrão passa a ser o Wi-Fi (o SSH pelo cabo continua: rede 172.16.42.0/24)
-    ip route del default dev usb0 2>/dev/null || true
-    # o udhcpc pega o endereço e fica em segundo plano para renová-lo antes de vencer
-    # (sem isso, quando acaba o "aluguel" que o roteador deu, a internet cai).
-    # O ^ é importante: só o processo cujo comando COMEÇA com udhcpc; sem ele, o pkill
-    # mataria também qualquer shell que tivesse esse texto no próprio comando.
-    pkill -f '^udhcpc -i wlan0' 2>/dev/null || true
-    udhcpc -i wlan0 -t 10 -n >/dev/null 2>&1 || { echo "wifi: conectou, mas o DHCP não respondeu"; exit 1; }
+    if ! conectado; then
+        # rede nova que não conectou não fica salva (o boot tentaria nela para sempre)
+        [ -n "$NOVA" ] && tira_rede "$2"
+        echo "wifi: não conectou (senha errada? rede longe?). Detalhes: logread | grep wpa"
+        # volta para as outras redes salvas, se houver
+        if grep -q '^network={' "$CONF"; then
+            supplicant
+            dhcp -b || true
+        else
+            killall wpa_supplicant 2>/dev/null || true
+        fi
+        exit 1
+    fi
+    cli enable_network all >/dev/null      # se esta cair, as outras salvas valem de novo
+    dhcp -t 10 -n || { echo "wifi: conectou, mas o DHCP não respondeu"; exit 1; }
     "$0" estado
+    if [ -n "$NOVA" ] && na_ram; then
+        echo "Para o iPhone conectar sozinho nos próximos boots, no PC: ./scripts/13-wifi-salvar.sh"
+    fi
+    ;;
+auto)
+    # o boot (iphone6-init) chama este em segundo plano; sem rede salva, nem liga o rádio
+    if ! grep -q '^network={' "$CONF" 2>/dev/null; then
+        echo "wifi: nenhuma rede salva"; echo "nenhuma rede salva" > "$ESTADO"; exit 0
+    fi
+    liga
+    supplicant
+    for i in $(seq 30); do conectado && break; sleep 1; done
+    # mesmo que nenhuma rede salva esteja ao alcance agora, o wpa_supplicant e o udhcpc
+    # (-b) continuam tentando sozinhos, e o Wi-Fi conecta quando ela aparecer
+    dhcp -b || true
+    "$0" estado
+    echo "wifi: $(cut -d' ' -f1 /proc/uptime) s depois do boot"
+    ;;
+esquecer)
+    [ -n "$2" ] || { echo "uso: wifi esquecer \"nome da rede\""; exit 1; }
+    tem_rede "$2" || { echo "wifi: \"$2\" não está salva"; exit 1; }
+    tira_rede "$2"
+    echo "wifi: \"$2\" esquecida"
+    # o wpa_supplicant em uso ainda a conhece: recomeça só com as que sobraram
+    if pidof wpa_supplicant >/dev/null; then supplicant; fi
+    if na_ram; then
+        echo "No PC, rode ./scripts/13-wifi-salvar.sh (senão ela volta no próximo boot)"
+    fi
     ;;
 estado)
     if [ ! -e /sys/class/net/wlan0 ]; then echo "wifi: desligado"; exit 0; fi
@@ -85,12 +184,14 @@ estado)
     iw dev wlan0 link | grep -q "^Connected" || echo "não conectado"
     ;;
 desligar)
-    killall wpa_supplicant udhcpc 2>/dev/null || true
+    pkill -f '^udhcpc -i wlan0' 2>/dev/null || true
+    killall wpa_supplicant 2>/dev/null || true
     [ -e /sys/class/net/wlan0 ] && ip link set wlan0 down
     rmmod brcmfmac_wcc brcmfmac 2>/dev/null || true
+    rm -f "$ESTADO"
     echo "wifi: desligado"
     ;;
 *)
-    sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
